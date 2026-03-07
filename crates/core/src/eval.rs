@@ -25,6 +25,14 @@ pub fn eval(value: &Value, env: &mut Env) -> LispResult {
             Ok(Value::vec(evaluated?))
         }
 
+        Value::Map(map) => {
+            let mut evaluated = std::collections::HashMap::new();
+            for (k, v) in map.iter() {
+                evaluated.insert(k.clone(), eval(v, env)?);
+            }
+            Ok(Value::Map(Arc::new(evaluated)))
+        }
+
         Value::List(items) => {
             if items.is_empty() {
                 return Ok(Value::list(vec![]));
@@ -58,6 +66,7 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "with" => return eval_with(&items[1..], env),
             "ns" => return eval_ns(&items[1..], env),
             "require" => return eval_require(&items[1..], env),
+            "match" => return eval_match(&items[1..], env),
             _ => {}
         }
     }
@@ -568,6 +577,120 @@ fn eval_with(args: &[Value], env: &mut Env) -> LispResult {
         eval(expr, &mut with_env)?;
     }
     eval(&body[body.len() - 1], &mut with_env)
+}
+
+/// (match value pattern1 expr1 pattern2 expr2 ...)
+fn eval_match(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() < 3 || args.len() % 2 != 1 {
+        return Err(LispError::new("match requires a value and pattern/expr pairs"));
+    }
+
+    let target = eval(&args[0], env)?;
+
+    for pair in args[1..].chunks(2) {
+        let pattern = &pair[0];
+        let body = &pair[1];
+
+        let mut bindings = Vec::new();
+        if match_pattern(pattern, &target, &mut bindings)? {
+            let mut match_env = Env::with_parent(Arc::new(env.clone()));
+            for (name, val) in bindings {
+                match_env.define(name, val);
+            }
+            return eval(body, &mut match_env);
+        }
+    }
+
+    Err(LispError::new(format!("no matching pattern for: {}", target)))
+}
+
+/// パターンマッチ: pattern が target にマッチするか判定し、束縛を収集
+fn match_pattern(
+    pattern: &Value,
+    target: &Value,
+    bindings: &mut Vec<(String, Value)>,
+) -> Result<bool, LispError> {
+    match pattern {
+        // _ はワイルドカード
+        Value::Symbol(s) if s.as_str() == "_" => Ok(true),
+
+        // シンボルは変数束縛 (何にでもマッチ)
+        Value::Symbol(s) => {
+            bindings.push((s.to_string(), target.clone()));
+            Ok(true)
+        }
+
+        // リテラルは値の一致
+        Value::Nil => Ok(matches!(target, Value::Nil)),
+        Value::Bool(b) => Ok(matches!(target, Value::Bool(tb) if tb == b)),
+        Value::Int(n) => Ok(match target {
+            Value::Int(tn) => tn == n,
+            Value::Float(tf) => *tf == *n as f64,
+            _ => false,
+        }),
+        Value::Float(n) => Ok(match target {
+            Value::Float(tf) => tf == n,
+            Value::Int(ti) => *n == *ti as f64,
+            _ => false,
+        }),
+        Value::Str(s) => Ok(matches!(target, Value::Str(ts) if ts == s)),
+        Value::Keyword(k) => Ok(matches!(target, Value::Keyword(tk) if tk == k)),
+
+        // リストパターン: 要素ごとにマッチ
+        Value::List(items) => {
+            if let Value::List(target_items) = target {
+                if items.len() != target_items.len() {
+                    return Ok(false);
+                }
+                for (p, t) in items.iter().zip(target_items.iter()) {
+                    if !match_pattern(p, t, bindings)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        // ベクタパターン: 要素ごとにマッチ
+        Value::Vec(items) => {
+            if let Value::Vec(target_items) = target {
+                if items.len() != target_items.len() {
+                    return Ok(false);
+                }
+                for (p, t) in items.iter().zip(target_items.iter()) {
+                    if !match_pattern(p, t, bindings)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        // マップパターン: 指定キーが存在し値がマッチ
+        Value::Map(map) => {
+            if let Value::Map(target_map) = target {
+                for (key, pat) in map.iter() {
+                    match target_map.get(key) {
+                        Some(val) => {
+                            if !match_pattern(pat, val, bindings)? {
+                                return Ok(false);
+                            }
+                        }
+                        None => return Ok(false),
+                    }
+                }
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        _ => Ok(false),
+    }
 }
 
 /// (ns name (export sym1 sym2 ...))
@@ -1132,6 +1255,76 @@ mod tests {
         assert_eq!(
             eval_str("(ns mymod (export add)) (defun add (a b) (+ a b)) (add 1 2)").unwrap(),
             Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn test_match_literal() {
+        assert_eq!(eval_str("(match 42 42 \"found\" _ \"nope\")").unwrap(), Value::str("found"));
+        assert_eq!(eval_str("(match 99 42 \"found\" _ \"nope\")").unwrap(), Value::str("nope"));
+    }
+
+    #[test]
+    fn test_match_binding() {
+        assert_eq!(
+            eval_str("(match 42 x (+ x 1))").unwrap(),
+            Value::Int(43)
+        );
+    }
+
+    #[test]
+    fn test_match_wildcard() {
+        assert_eq!(
+            eval_str("(match 42 _ \"anything\")").unwrap(),
+            Value::str("anything")
+        );
+    }
+
+    #[test]
+    fn test_match_list_pattern() {
+        assert_eq!(
+            eval_str("(match '(1 2 3) (a b c) (+ a b c))").unwrap(),
+            Value::Int(6)
+        );
+    }
+
+    #[test]
+    fn test_match_vec_pattern() {
+        assert_eq!(
+            eval_str("(match [1 2] [a b] (+ a b))").unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn test_match_nested() {
+        assert_eq!(
+            eval_str("(match '(1 (2 3)) (a (b c)) (+ a b c))").unwrap(),
+            Value::Int(6)
+        );
+    }
+
+    #[test]
+    fn test_match_map_pattern() {
+        assert_eq!(
+            eval_str("(match {:name \"alice\" :age 30} {:name n} n)").unwrap(),
+            Value::str("alice")
+        );
+    }
+
+    #[test]
+    fn test_match_multiple_patterns() {
+        assert_eq!(
+            eval_str("(match 2 1 \"one\" 2 \"two\" 3 \"three\")").unwrap(),
+            Value::str("two")
+        );
+    }
+
+    #[test]
+    fn test_match_nil() {
+        assert_eq!(
+            eval_str("(match nil nil \"got nil\" _ \"not nil\")").unwrap(),
+            Value::str("got nil")
         );
     }
 
