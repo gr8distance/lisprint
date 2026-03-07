@@ -47,6 +47,9 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "defmacro" => return eval_defmacro(&items[1..], env),
             "macroexpand" => return eval_macroexpand(&items[1..], env),
             "loop" => return eval_loop(&items[1..], env),
+            "throw" => return eval_throw(&items[1..], env),
+            "try" => return eval_try(&items[1..], env),
+            "with" => return eval_with(&items[1..], env),
             _ => {}
         }
     }
@@ -471,6 +474,94 @@ fn quote_value(val: Value) -> Value {
     Value::list(vec![Value::symbol("quote"), val])
 }
 
+/// (throw value)
+fn eval_throw(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() != 1 {
+        return Err(LispError::new("throw requires exactly 1 argument"));
+    }
+    let val = eval(&args[0], env)?;
+    Err(LispError::thrown(val))
+}
+
+/// (try body... (catch e handler...))
+fn eval_try(args: &[Value], env: &mut Env) -> LispResult {
+    if args.is_empty() {
+        return Err(LispError::new("try requires a body"));
+    }
+
+    // 最後の引数が (catch e ...) かチェック
+    let (body, catch_clause) = match args.last() {
+        Some(Value::List(items))
+            if !items.is_empty()
+                && matches!(&items[0], Value::Symbol(s) if s.as_str() == "catch") =>
+        {
+            (&args[..args.len() - 1], Some(items.as_slice()))
+        }
+        _ => (args, None),
+    };
+
+    // body を評価
+    let mut result = Value::Nil;
+    for expr in body {
+        match eval(expr, env) {
+            Ok(val) => result = val,
+            Err(err) => {
+                // catch 節があればエラーをハンドル
+                if let Some(clause) = catch_clause {
+                    if clause.len() < 3 {
+                        return Err(LispError::new("catch requires error binding and handler"));
+                    }
+                    let err_name = clause[1].as_symbol()?;
+                    let mut catch_env = Env::with_parent(Arc::new(env.clone()));
+                    // thrown value があればそれを、なければ文字列メッセージを束縛
+                    let err_val = err.thrown.unwrap_or_else(|| Value::str(err.message));
+                    catch_env.define(err_name, err_val);
+                    let handler = &clause[2..];
+                    let mut handler_result = Value::Nil;
+                    for expr in handler {
+                        handler_result = eval(expr, &mut catch_env)?;
+                    }
+                    return Ok(handler_result);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// (with [name expr ...] body...) — nil短絡
+fn eval_with(args: &[Value], env: &mut Env) -> LispResult {
+    if args.is_empty() {
+        return Err(LispError::new("with requires bindings"));
+    }
+
+    let bindings = args[0].as_vec().or_else(|_| args[0].as_list())?;
+    if bindings.len() % 2 != 0 {
+        return Err(LispError::new("with bindings must have even number of elements"));
+    }
+
+    let mut with_env = Env::with_parent(Arc::new(env.clone()));
+
+    for chunk in bindings.chunks(2) {
+        let name = chunk[0].as_symbol()?;
+        let val = eval(&chunk[1], &mut with_env)?;
+        if val.is_nil() {
+            return Ok(Value::Nil);
+        }
+        with_env.define(name, val);
+    }
+
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Value::Nil);
+    }
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &mut with_env)?;
+    }
+    eval(&body[body.len() - 1], &mut with_env)
+}
+
 // --- ヘルパー ---
 
 fn parse_params(value: &Value) -> Result<Vec<String>, LispError> {
@@ -741,6 +832,71 @@ mod tests {
         assert_eq!(
             eval_with_prelude("(reject even? '(1 2 3 4 5))").unwrap(),
             Value::list(vec![Value::Int(1), Value::Int(3), Value::Int(5)])
+        );
+    }
+
+    #[test]
+    fn test_throw_catch() {
+        assert_eq!(
+            eval_str("(try (throw \"boom\") (catch e e))").unwrap(),
+            Value::str("boom")
+        );
+    }
+
+    #[test]
+    fn test_throw_catch_value() {
+        assert_eq!(
+            eval_str("(try (throw 42) (catch e (+ e 1)))").unwrap(),
+            Value::Int(43)
+        );
+    }
+
+    #[test]
+    fn test_try_no_error() {
+        assert_eq!(
+            eval_str("(try (+ 1 2) (catch e 0))").unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn test_try_catches_runtime_error() {
+        // undefined symbol is a runtime error
+        assert_eq!(
+            eval_str("(try (+ undefined 1) (catch e e))").unwrap(),
+            Value::str("undefined symbol: undefined")
+        );
+    }
+
+    #[test]
+    fn test_with_all_non_nil() {
+        assert_eq!(
+            eval_str("(with [a 1 b 2] (+ a b))").unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn test_with_short_circuit() {
+        assert_eq!(
+            eval_str("(with [a nil b 2] (+ a b))").unwrap(),
+            Value::Nil
+        );
+    }
+
+    #[test]
+    fn test_with_second_nil() {
+        assert_eq!(
+            eval_str("(with [a 1 b nil] (+ a b))").unwrap(),
+            Value::Nil
+        );
+    }
+
+    #[test]
+    fn test_with_dependent_bindings() {
+        assert_eq!(
+            eval_str("(with [a 10 b (+ a 5)] b)").unwrap(),
+            Value::Int(15)
         );
     }
 

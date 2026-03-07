@@ -38,11 +38,18 @@ pub struct NativeFnData {
 #[derive(Clone, Debug)]
 pub struct LispError {
     pub message: String,
+    /// throw で投げられた値 (try/catchで取得可能)
+    pub thrown: Option<Value>,
 }
 
 impl LispError {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self { message: msg.into() }
+        Self { message: msg.into(), thrown: None }
+    }
+
+    pub fn thrown(value: Value) -> Self {
+        let message = format!("{}", value);
+        Self { message, thrown: Some(value) }
     }
 }
 
