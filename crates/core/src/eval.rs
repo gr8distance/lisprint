@@ -147,25 +147,79 @@ fn eval_def(args: &[Value], env: &mut Env) -> LispResult {
     Ok(val)
 }
 
-/// (defun name (params...) body...)
+/// (defun name (params...) body...) — 単一アリティ
+/// (defun name ((params1) body1) ((params2) body2) ...) — 複数アリティ
 fn eval_defun(args: &[Value], env: &mut Env) -> LispResult {
-    if args.len() < 3 {
-        return Err(LispError::new("defun requires name, params, and body"));
+    if args.len() < 2 {
+        return Err(LispError::new("defun requires name and body"));
     }
 
     let name = args[0].as_symbol()?.to_string();
-    let params = parse_params(&args[1])?;
-    let body = args[2..].to_vec();
 
-    let func = Value::Fn(Arc::new(LispFn {
-        name: Some(name.clone()),
-        params,
-        body,
-        env: env.clone(),
-    }));
+    // 複数アリティ: args[1] が (params body...) のリスト形式かチェック
+    let is_multi = if let Value::List(items) = &args[1] {
+        !items.is_empty() && matches!(&items[0], Value::List(_) | Value::Vec(_))
+    } else {
+        false
+    };
 
-    env.define(name, func.clone());
-    Ok(func)
+    if is_multi {
+        // 複数アリティ: 各節を個別のFnに変換し、NativeFnで分岐
+        let mut arity_fns: Vec<Value> = Vec::new();
+        for clause in &args[1..] {
+            let items = clause.as_list()?;
+            if items.len() < 2 {
+                return Err(LispError::new("each arity requires params and body"));
+            }
+            let params = parse_params(&items[0])?;
+            let body = items[1..].to_vec();
+            arity_fns.push(Value::Fn(Arc::new(LispFn {
+                name: Some(name.clone()),
+                params,
+                body,
+                env: env.clone(),
+            })));
+        }
+
+        let fn_name = name.clone();
+        let func = Value::NativeFn(Arc::new(NativeFnData {
+            name: name.clone(),
+            func: Box::new(move |call_args| {
+                for arity_fn in &arity_fns {
+                    if let Value::Fn(lf) = arity_fn {
+                        if lf.params.len() == call_args.len() {
+                            return apply(arity_fn, call_args);
+                        }
+                    }
+                }
+                Err(LispError::new(format!(
+                    "{}: no matching arity for {} args",
+                    fn_name,
+                    call_args.len()
+                )))
+            }),
+        }));
+
+        env.define(name, func.clone());
+        Ok(func)
+    } else {
+        // 単一アリティ (従来通り)
+        if args.len() < 3 {
+            return Err(LispError::new("defun requires name, params, and body"));
+        }
+        let params = parse_params(&args[1])?;
+        let body = args[2..].to_vec();
+
+        let func = Value::Fn(Arc::new(LispFn {
+            name: Some(name.clone()),
+            params,
+            body,
+            env: env.clone(),
+        }));
+
+        env.define(name, func.clone());
+        Ok(func)
+    }
 }
 
 /// (fn (params...) body...)
@@ -215,9 +269,8 @@ fn eval_let(args: &[Value], env: &mut Env) -> LispResult {
     let mut let_env = Env::with_parent(Arc::new(env.clone()));
 
     for chunk in bindings.chunks(2) {
-        let name = chunk[0].as_symbol()?;
         let val = eval(&chunk[1], &mut let_env)?;
-        let_env.define(name, val);
+        destructure_bind(&chunk[0], &val, &mut let_env)?;
     }
 
     // evaluate body
@@ -1059,6 +1112,59 @@ fn get_module_exports(env: &Env) -> Vec<String> {
 
 // --- ヘルパー ---
 
+/// 分配束縛: パターンに基づいて値を分解し環境に束縛
+fn destructure_bind(pattern: &Value, val: &Value, env: &mut Env) -> Result<(), LispError> {
+    match pattern {
+        // 通常のシンボル束縛
+        Value::Symbol(s) => {
+            env.define(s.to_string(), val.clone());
+            Ok(())
+        }
+
+        // ベクタ分配束縛: [a b c]
+        Value::Vec(items) => {
+            let target = val.as_vec().or_else(|_| val.as_list())?;
+            if items.len() != target.len() {
+                return Err(LispError::new(format!(
+                    "destructuring: expected {} elements, got {}",
+                    items.len(),
+                    target.len()
+                )));
+            }
+            for (p, v) in items.iter().zip(target.iter()) {
+                destructure_bind(p, v, env)?;
+            }
+            Ok(())
+        }
+
+        // マップ分配束縛: {:key1 name1 :key2 name2}
+        Value::Map(map) => {
+            let target_map = match val {
+                Value::Map(m) => m,
+                Value::TypeInstance(inst) => {
+                    // TypeInstance もマップとして分配束縛可能
+                    for (key, bind_pat) in map.iter() {
+                        let v = inst.fields.get(key).cloned().unwrap_or(Value::Nil);
+                        destructure_bind(bind_pat, &v, env)?;
+                    }
+                    return Ok(());
+                }
+                _ => return Err(LispError::new("destructuring: expected map")),
+            };
+            for (key, bind_pat) in map.iter() {
+                let v = target_map.get(key).cloned().unwrap_or(Value::Nil);
+                destructure_bind(bind_pat, &v, env)?;
+            }
+            Ok(())
+        }
+
+        _ => Err(LispError::new(format!(
+            "invalid destructuring pattern: {}",
+            pattern
+        ))),
+    }
+}
+
 fn parse_params(value: &Value) -> Result<Vec<String>, LispError> {
     let items = value.as_vec().or_else(|_| value.as_list())?;
     items
@@ -1524,6 +1630,63 @@ mod tests {
                 (.describe p)
             ").unwrap(),
             Value::str("Point(3,4)")
+        );
+    }
+
+    #[test]
+    fn test_multi_arity() {
+        assert_eq!(
+            eval_str("
+                (defun greet
+                    ((name) (str \"hello \" name))
+                    ((first last) (str \"hello \" first \" \" last)))
+                (greet \"alice\")
+            ").unwrap(),
+            Value::str("hello alice")
+        );
+        assert_eq!(
+            eval_str("
+                (defun greet
+                    ((name) (str \"hello \" name))
+                    ((first last) (str \"hello \" first \" \" last)))
+                (greet \"alice\" \"smith\")
+            ").unwrap(),
+            Value::str("hello alice smith")
+        );
+    }
+
+    #[test]
+    fn test_multi_arity_error() {
+        let result = eval_str("
+            (defun greet
+                ((name) name)
+                ((first last) first))
+            (greet 1 2 3)
+        ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_destructure_vec_let() {
+        assert_eq!(
+            eval_str("(let [[a b c] [1 2 3]] (+ a b c))").unwrap(),
+            Value::Int(6)
+        );
+    }
+
+    #[test]
+    fn test_destructure_map_let() {
+        assert_eq!(
+            eval_str("(let [{:name n :age a} {:name \"alice\" :age 30}] (str n \" is \" a))").unwrap(),
+            Value::str("alice is 30")
+        );
+    }
+
+    #[test]
+    fn test_destructure_nested() {
+        assert_eq!(
+            eval_str("(let [[a [b c]] [1 [2 3]]] (+ a b c))").unwrap(),
+            Value::Int(6)
         );
     }
 
