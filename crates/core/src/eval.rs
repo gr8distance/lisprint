@@ -651,4 +651,104 @@ mod tests {
             Value::Int(10) // lexical scope: get-x captures x=10
         );
     }
+
+    // --- prelude tests ---
+
+    fn eval_with_prelude(input: &str) -> LispResult {
+        let mut env = Env::new();
+        crate::builtins::register(&mut env);
+        crate::prelude::load(&mut env).unwrap();
+        let exprs = parse(input).unwrap();
+        let mut result = Value::Nil;
+        for expr in &exprs {
+            result = eval(expr, &mut env)?;
+        }
+        Ok(result)
+    }
+
+    #[test]
+    fn test_prelude_map() {
+        assert_eq!(
+            eval_with_prelude("(map inc '(1 2 3))").unwrap(),
+            Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)])
+        );
+    }
+
+    #[test]
+    fn test_prelude_filter() {
+        assert_eq!(
+            eval_with_prelude("(filter even? '(1 2 3 4 5))").unwrap(),
+            Value::list(vec![Value::Int(2), Value::Int(4)])
+        );
+    }
+
+    #[test]
+    fn test_prelude_reduce() {
+        assert_eq!(
+            eval_with_prelude("(reduce + 0 '(1 2 3 4 5))").unwrap(),
+            Value::Int(15)
+        );
+    }
+
+    #[test]
+    fn test_prelude_when_unless() {
+        assert_eq!(eval_with_prelude("(when true 42)").unwrap(), Value::Int(42));
+        assert_eq!(eval_with_prelude("(when false 42)").unwrap(), Value::Nil);
+        assert_eq!(eval_with_prelude("(unless false 42)").unwrap(), Value::Int(42));
+        assert_eq!(eval_with_prelude("(unless true 42)").unwrap(), Value::Nil);
+    }
+
+    #[test]
+    fn test_prelude_utilities() {
+        assert_eq!(eval_with_prelude("(inc 5)").unwrap(), Value::Int(6));
+        assert_eq!(eval_with_prelude("(dec 5)").unwrap(), Value::Int(4));
+        assert_eq!(eval_with_prelude("(zero? 0)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_with_prelude("(zero? 1)").unwrap(), Value::Bool(false));
+        assert_eq!(eval_with_prelude("(even? 4)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_with_prelude("(odd? 3)").unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn test_prelude_range() {
+        assert_eq!(
+            eval_with_prelude("(range 5)").unwrap(),
+            Value::list(vec![Value::Int(0), Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])
+        );
+    }
+
+    #[test]
+    fn test_prelude_comp() {
+        assert_eq!(
+            eval_with_prelude("(def inc2 (comp inc inc)) (inc2 5)").unwrap(),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn test_prelude_find() {
+        assert_eq!(
+            eval_with_prelude("(find even? '(1 3 4 5))").unwrap(),
+            Value::Int(4)
+        );
+        assert_eq!(
+            eval_with_prelude("(find even? '(1 3 5))").unwrap(),
+            Value::Nil
+        );
+    }
+
+    #[test]
+    fn test_prelude_reject() {
+        assert_eq!(
+            eval_with_prelude("(reject even? '(1 2 3 4 5))").unwrap(),
+            Value::list(vec![Value::Int(1), Value::Int(3), Value::Int(5)])
+        );
+    }
+
+    #[test]
+    fn test_prelude_flatten() {
+        assert_eq!(
+            eval_with_prelude("(flatten '(1 (2 3) (4 (5))))").unwrap(),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5)])
+        );
+    }
 }

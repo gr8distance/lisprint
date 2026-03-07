@@ -4,6 +4,7 @@ use lisprint_core::builtins;
 use lisprint_core::env::Env;
 use lisprint_core::eval;
 use lisprint_core::parser;
+use lisprint_core::prelude;
 
 fn main() {
     let args: Vec<String> = std_env::args().collect();
@@ -32,6 +33,7 @@ fn run_repl() {
 
     let mut env = Env::new();
     builtins::register(&mut env);
+    prelude::load(&mut env).expect("failed to load prelude");
 
     let mut rl = rustyline::DefaultEditor::new().expect("failed to initialize editor");
 
@@ -92,6 +94,7 @@ fn run_file(path: &str) {
 
     let mut env = Env::new();
     builtins::register(&mut env);
+    prelude::load(&mut env).expect("failed to load prelude");
 
     match parser::parse(&source) {
         Ok(exprs) => {

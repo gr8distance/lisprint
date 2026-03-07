@@ -29,6 +29,7 @@ pub fn register(env: &mut Env) {
     register_fn(env, "nth", builtin_nth);
     register_fn(env, "count", builtin_count);
     register_fn(env, "empty?", builtin_empty);
+    register_fn(env, "concat", builtin_concat);
 
     // 型判定
     register_fn(env, "nil?", builtin_nil_q);
@@ -271,6 +272,18 @@ fn builtin_empty(args: &[Value]) -> LispResult {
         Value::Nil => Ok(Value::Bool(true)),
         _ => Err(LispError::new("empty? requires a collection")),
     }
+}
+
+fn builtin_concat(args: &[Value]) -> LispResult {
+    let mut result = Vec::new();
+    for arg in args {
+        match arg {
+            Value::List(v) | Value::Vec(v) => result.extend_from_slice(v),
+            Value::Nil => {}
+            _ => return Err(LispError::new("concat requires lists")),
+        }
+    }
+    Ok(Value::list(result))
 }
 
 // --- 型判定 ---
