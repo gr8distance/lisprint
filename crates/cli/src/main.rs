@@ -25,10 +25,13 @@ fn main() {
         }
         Some("build") => {
             if let Some(path) = args.get(2) {
-                let output = args.get(3).map(|s| s.as_str());
-                build_binary(path, output);
+                let container = args.iter().any(|a| a == "--container");
+                let output = args[3..].iter()
+                    .find(|a| !a.starts_with("--"))
+                    .map(|s| s.as_str());
+                build_binary(path, output, container);
             } else {
-                eprintln!("Usage: lisprint build <file.lisp> [output]");
+                eprintln!("Usage: lisprint build <file.lisp> [output] [--container]");
                 std::process::exit(1);
             }
         }
@@ -182,7 +185,7 @@ fn find_test_files(dir: &str) -> Vec<String> {
     files
 }
 
-fn build_binary(path: &str, output: Option<&str>) {
+fn build_binary(path: &str, output: Option<&str>, container: bool) {
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -342,6 +345,34 @@ int main() {
             eprintln!("Failed to run linker: {}", e);
             std::process::exit(1);
         }
+    }
+
+    if container {
+        let bin_name = std::path::Path::new(output_name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("app");
+
+        let dockerfile = format!(
+            r#"FROM scratch
+COPY {bin_name} /app
+ENTRYPOINT ["/app"]
+"#
+        );
+
+        let dockerfile_path = format!("Dockerfile.{}", bin_name);
+        if let Err(e) = std::fs::write(&dockerfile_path, &dockerfile) {
+            eprintln!("Error writing Dockerfile: {}", e);
+            std::process::exit(1);
+        }
+        println!("Dockerfile: {}", dockerfile_path);
+        println!();
+        println!("To build container:");
+        println!("  docker build -f {} -t {} .", dockerfile_path, bin_name);
+        println!("  docker run {}", bin_name);
+        println!();
+        println!("Note: For scratch containers, rebuild with a static-linked binary:");
+        println!("  Cross-compile with musl: CC=musl-gcc lisprint build {} {} --container", path, output_name);
     }
 }
 
