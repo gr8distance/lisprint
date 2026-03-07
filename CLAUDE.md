@@ -15,6 +15,9 @@ lisprint/
 │   │   ├── builtins.rs # 組み込み関数
 │   │   ├── prelude.rs # preludeローダー
 │   │   └── stdlib/    # Rustネイティブstdlibモジュール群
+│   └── compiler/      # Craneliftコンパイラ (lisprint-compiler)
+│       ├── compiler.rs # AST → Cranelift IR → object
+│       └── runtime.rs  # ランタイムbridge関数
 │   └── cli/           # CLI (lisprint)
 │       └── main.rs    # REPL + ファイル実行 + test
 └── lib/
@@ -53,7 +56,8 @@ cargo run -- repl      # REPL起動 (明示)
 cargo run -- run FILE  # ファイル実行
 cargo run -- test      # *_test.lisp 自動検出・テスト実行
 cargo run -- test FILE # 指定ファイルのテスト実行
-cargo test             # Rustテスト実行 (94テスト)
+cargo test             # Rustテスト実行 (118テスト)
+cargo run -- build FILE [output] [--container]  # ネイティブバイナリ生成
 ```
 
 ## 開発ルール
