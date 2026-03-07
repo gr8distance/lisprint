@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::env::Env;
-use crate::value::{LispError, LispFn, LispResult, Value};
+use crate::value::{LispError, LispFn, LispResult, NativeFnData, TypeInstanceData, Value};
 
 thread_local! {
     static LOADING_MODULES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
@@ -67,7 +67,15 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "ns" => return eval_ns(&items[1..], env),
             "require" => return eval_require(&items[1..], env),
             "match" => return eval_match(&items[1..], env),
-            _ => {}
+            "deftype" => return eval_deftype(&items[1..], env),
+            "deftrait" => return eval_deftrait(&items[1..], env),
+            "defimpl" => return eval_defimpl(&items[1..], env),
+            _ => {
+                // .field アクセス: (.field obj)
+                if name.starts_with('.') && name.len() > 1 {
+                    return eval_dot_access(&name[1..], &items[1..], env);
+                }
+            }
         }
     }
 
@@ -577,6 +585,154 @@ fn eval_with(args: &[Value], env: &mut Env) -> LispResult {
         eval(expr, &mut with_env)?;
     }
     eval(&body[body.len() - 1], &mut with_env)
+}
+
+/// (deftype Name (field1 field2 ...))
+fn eval_deftype(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() != 2 {
+        return Err(LispError::new("deftype requires name and fields"));
+    }
+
+    let type_name = args[0].as_symbol()?.to_string();
+    let field_list = args[1].as_list().or_else(|_| args[1].as_vec())?;
+    let field_names: Vec<String> = field_list
+        .iter()
+        .map(|v| v.as_symbol().map(|s| s.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // コンストラクタ関数を登録: (TypeName val1 val2 ...) → TypeInstance
+    let tn = type_name.clone();
+    let fnames = field_names.clone();
+    let constructor = Value::NativeFn(Arc::new(NativeFnData {
+        name: type_name.clone(),
+        func: Box::new(move |args| {
+            if args.len() != fnames.len() {
+                return Err(LispError::new(format!(
+                    "{}: expected {} args, got {}",
+                    tn,
+                    fnames.len(),
+                    args.len()
+                )));
+            }
+            let mut fields = std::collections::HashMap::new();
+            for (name, val) in fnames.iter().zip(args.iter()) {
+                fields.insert(name.clone(), val.clone());
+            }
+            Ok(Value::TypeInstance(Arc::new(TypeInstanceData {
+                type_name: tn.clone(),
+                fields,
+            })))
+        }),
+    }));
+
+    env.define(type_name.clone(), constructor);
+
+    // 型判定関数: (TypeName? val) → bool
+    let tn2 = type_name.clone();
+    let predicate = Value::NativeFn(Arc::new(NativeFnData {
+        name: format!("{}?", type_name),
+        func: Box::new(move |args| {
+            if args.len() != 1 {
+                return Err(LispError::new(format!("{}? requires 1 argument", tn2)));
+            }
+            Ok(Value::Bool(matches!(&args[0], Value::TypeInstance(inst) if inst.type_name == tn2)))
+        }),
+    }));
+    env.define(format!("{}?", type_name), predicate);
+
+    Ok(Value::Nil)
+}
+
+/// (.field obj) — フィールドアクセス
+fn eval_dot_access(field_name: &str, args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() != 1 {
+        return Err(LispError::new(format!(".{} requires exactly 1 argument", field_name)));
+    }
+    let obj = eval(&args[0], env)?;
+
+    // TypeInstance のフィールドアクセス (フィールドがあればそれを返す)
+    if let Value::TypeInstance(inst) = &obj {
+        if let Some(val) = inst.fields.get(field_name) {
+            return Ok(val.clone());
+        }
+        // フィールドになければ trait メソッドを検索
+        let method_key = format!("__trait:{}/{}__", inst.type_name, field_name);
+        if let Ok(method) = env.get(&method_key) {
+            return apply(&method, &[obj]);
+        }
+        return Err(LispError::new(format!(
+            "{} has no field or method '{}'",
+            inst.type_name, field_name
+        )));
+    }
+
+    // Map のキーアクセス
+    if let Value::Map(map) = &obj {
+        return Ok(map.get(field_name).cloned().unwrap_or(Value::Nil));
+    }
+
+    Err(LispError::new(format!("cannot access .{} on {}", field_name, obj.type_name())))
+}
+
+/// (deftrait TraitName (method1 (self args...)) (method2 (self)) ...)
+fn eval_deftrait(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() < 2 {
+        return Err(LispError::new("deftrait requires name and method signatures"));
+    }
+
+    let trait_name = args[0].as_symbol()?.to_string();
+
+    // トレイト定義を保存 (メソッド名リスト)
+    let method_names: Vec<Value> = args[1..]
+        .iter()
+        .filter_map(|clause| {
+            if let Value::List(items) = clause {
+                items.first().cloned()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    env.define(
+        format!("__trait:{}__", trait_name),
+        Value::list(method_names),
+    );
+
+    Ok(Value::Nil)
+}
+
+/// (defimpl TraitName TypeName (method (self args...) body...) ...)
+fn eval_defimpl(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() < 3 {
+        return Err(LispError::new("defimpl requires trait name, type name, and methods"));
+    }
+
+    let _trait_name = args[0].as_symbol()?;
+    let type_name = args[1].as_symbol()?.to_string();
+
+    for method_def in &args[2..] {
+        let items = method_def.as_list()?;
+        if items.len() < 3 {
+            return Err(LispError::new("defimpl method requires name, params, and body"));
+        }
+
+        let method_name = items[0].as_symbol()?.to_string();
+        let params = parse_params(&items[1])?;
+        let body = items[2..].to_vec();
+
+        let func = Value::Fn(Arc::new(LispFn {
+            name: Some(method_name.clone()),
+            params,
+            body,
+            env: env.clone(),
+        }));
+
+        // __trait:TypeName/method__ として登録
+        env.define(format!("__trait:{}/{}__", type_name, method_name), func);
+    }
+
+    Ok(Value::Nil)
 }
 
 /// (match value pattern1 expr1 pattern2 expr2 ...)
@@ -1325,6 +1481,57 @@ mod tests {
         assert_eq!(
             eval_str("(match nil nil \"got nil\" _ \"not nil\")").unwrap(),
             Value::str("got nil")
+        );
+    }
+
+    #[test]
+    fn test_deftype_constructor() {
+        assert_eq!(
+            eval_str("(deftype Point (x y)) (def p (Point 1 2)) (.x p)").unwrap(),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn test_deftype_field_access() {
+        assert_eq!(
+            eval_str("(deftype Point (x y)) (def p (Point 10 20)) (+ (.x p) (.y p))").unwrap(),
+            Value::Int(30)
+        );
+    }
+
+    #[test]
+    fn test_deftype_predicate() {
+        assert_eq!(
+            eval_str("(deftype Point (x y)) (def p (Point 1 2)) (Point? p)").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_str("(deftype Point (x y)) (Point? 42)").unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_deftrait_defimpl() {
+        assert_eq!(
+            eval_str("
+                (deftype Point (x y))
+                (deftrait Describable (describe (self)))
+                (defimpl Describable Point
+                    (describe (self) (str \"Point(\" (.x self) \",\" (.y self) \")\")))
+                (def p (Point 3 4))
+                (.describe p)
+            ").unwrap(),
+            Value::str("Point(3,4)")
+        );
+    }
+
+    #[test]
+    fn test_dot_access_map() {
+        assert_eq!(
+            eval_str("(def m {:name \"alice\"}) (.name m)").unwrap(),
+            Value::str("alice")
         );
     }
 

@@ -18,6 +18,14 @@ pub enum Value {
     Fn(Arc<LispFn>),
     NativeFn(Arc<NativeFnData>),
     Macro(Arc<LispFn>),
+    /// ユーザー定義型のインスタンス
+    TypeInstance(Arc<TypeInstanceData>),
+}
+
+/// ユーザー定義型のインスタンスデータ
+pub struct TypeInstanceData {
+    pub type_name: String,
+    pub fields: HashMap<String, Value>,
 }
 
 /// Lispで定義された関数
@@ -168,6 +176,14 @@ impl Value {
             Value::Fn(_) => "fn",
             Value::NativeFn(_) => "fn",
             Value::Macro(_) => "macro",
+            Value::TypeInstance(_) => "type-instance",
+        }
+    }
+
+    pub fn as_type_instance(&self) -> Result<&TypeInstanceData, LispError> {
+        match self {
+            Value::TypeInstance(inst) => Ok(inst),
+            _ => Err(LispError::new(format!("expected type instance, got {}", self.type_name()))),
         }
     }
 }
@@ -215,6 +231,13 @@ impl fmt::Display for Value {
             Value::Macro(m) => {
                 write!(f, "<macro {}>", m.name.as_deref().unwrap_or("anonymous"))
             }
+            Value::TypeInstance(inst) => {
+                write!(f, "({}", inst.type_name)?;
+                for (k, v) in &inst.fields {
+                    write!(f, " :{} {}", k, v)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -239,6 +262,9 @@ impl PartialEq for Value {
             (Value::Keyword(a), Value::Keyword(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Vec(a), Value::Vec(b)) => a == b,
+            (Value::TypeInstance(a), Value::TypeInstance(b)) => {
+                a.type_name == b.type_name && a.fields == b.fields
+            }
             _ => false,
         }
     }
