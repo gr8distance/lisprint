@@ -1926,6 +1926,26 @@ mod tests {
     }
 
     #[test]
+    fn test_require_stdlib_async() {
+        // Test spawn/await
+        let result = eval_str("(require 'async) (def f (async/spawn (fn () (+ 1 2)))) (async/await f)").unwrap();
+        assert_eq!(result, Value::Int(3));
+    }
+
+    #[test]
+    fn test_require_stdlib_async_channel() {
+        let result = eval_str(r#"
+            (require 'async)
+            (def ch (async/channel))
+            (def s (.sender ch))
+            (def r (.receiver ch))
+            (async/spawn (fn () (async/send s 42)))
+            (async/recv r)
+        "#).unwrap();
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
     fn test_require_stdlib_http_server() {
         let result = eval_str("(require 'http/server) (fn? server/start)").unwrap();
         assert_eq!(result, Value::Bool(true));

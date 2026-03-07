@@ -19,6 +19,7 @@ pub fn registry() -> HashMap<&'static str, ModuleRegisterFn> {
     map.insert("re", re::register);
     map.insert("http", http::register);
     map.insert("http/server", http_server::register);
+    map.insert("async", async_mod::register);
     map
 }
 
@@ -33,6 +34,7 @@ pub fn load_stdlib(name: &str, env: &mut Env) -> Result<bool, LispError> {
     }
 }
 
+pub mod async_mod;
 pub mod fs;
 pub mod http;
 pub mod http_server;
