@@ -71,6 +71,12 @@ pub fn apply(func: &Value, args: &[Value]) -> LispResult {
             }
 
             let mut fn_env = Env::with_parent(Arc::new(lisp_fn.env.clone()));
+
+            // 再帰呼び出し対応: 名前付き関数は自分自身を環境に注入
+            if let Some(name) = &lisp_fn.name {
+                fn_env.define(name.clone(), func.clone());
+            }
+
             for (param, arg) in lisp_fn.params.iter().zip(args.iter()) {
                 fn_env.define(param.clone(), arg.clone());
             }

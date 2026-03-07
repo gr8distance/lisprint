@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 lisprint-core = { path = "../core" }
+rustyline = "15"
