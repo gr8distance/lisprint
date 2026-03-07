@@ -48,6 +48,11 @@ pub fn register(env: &mut Env) {
     // その他
     register_fn(env, "apply", builtin_apply);
     register_fn(env, "identity", builtin_identity);
+
+    // テスト用アサーション
+    register_fn(env, "assert=", builtin_assert_eq);
+    register_fn(env, "assert-true", builtin_assert_true);
+    register_fn(env, "assert-nil", builtin_assert_nil);
 }
 
 fn register_fn(
@@ -372,4 +377,48 @@ fn builtin_identity(args: &[Value]) -> LispResult {
         return Err(LispError::new("identity requires exactly 1 argument"));
     }
     Ok(args[0].clone())
+}
+
+// --- テスト用アサーション ---
+
+fn builtin_assert_eq(args: &[Value]) -> LispResult {
+    if args.len() != 2 {
+        return Err(LispError::new("assert= requires exactly 2 arguments"));
+    }
+    if args[0] == args[1] {
+        Ok(Value::Bool(true))
+    } else {
+        Err(LispError::new(format!(
+            "assertion failed: {} != {}",
+            args[0], args[1]
+        )))
+    }
+}
+
+fn builtin_assert_true(args: &[Value]) -> LispResult {
+    if args.len() != 1 {
+        return Err(LispError::new("assert-true requires exactly 1 argument"));
+    }
+    if args[0].is_truthy() {
+        Ok(Value::Bool(true))
+    } else {
+        Err(LispError::new(format!(
+            "assertion failed: expected truthy, got {}",
+            args[0]
+        )))
+    }
+}
+
+fn builtin_assert_nil(args: &[Value]) -> LispResult {
+    if args.len() != 1 {
+        return Err(LispError::new("assert-nil requires exactly 1 argument"));
+    }
+    if args[0].is_nil() {
+        Ok(Value::Bool(true))
+    } else {
+        Err(LispError::new(format!(
+            "assertion failed: expected nil, got {}",
+            args[0]
+        )))
+    }
 }

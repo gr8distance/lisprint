@@ -67,6 +67,7 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "ns" => return eval_ns(&items[1..], env),
             "require" => return eval_require(&items[1..], env),
             "match" => return eval_match(&items[1..], env),
+            "deftest" => return eval_deftest(&items[1..], env),
             "deftype" => return eval_deftype(&items[1..], env),
             "deftrait" => return eval_deftrait(&items[1..], env),
             "defimpl" => return eval_defimpl(&items[1..], env),
@@ -638,6 +639,67 @@ fn eval_with(args: &[Value], env: &mut Env) -> LispResult {
         eval(expr, &mut with_env)?;
     }
     eval(&body[body.len() - 1], &mut with_env)
+}
+
+/// (deftest name body...)
+fn eval_deftest(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() < 2 {
+        return Err(LispError::new("deftest requires name and body"));
+    }
+
+    let name = args[0].as_symbol()?.to_string();
+    let body = args[1..].to_vec();
+
+    // テスト関数として登録
+    let test_fn = Value::Fn(Arc::new(LispFn {
+        name: Some(name.clone()),
+        params: vec![],
+        body,
+        env: env.clone(),
+    }));
+
+    // テストレジストリに追加
+    let registry_key = "__tests__";
+    let mut tests = if let Ok(Value::List(existing)) = env.get(registry_key) {
+        existing.to_vec()
+    } else {
+        vec![]
+    };
+    tests.push(Value::list(vec![Value::str(&name), test_fn]));
+    env.define(registry_key, Value::list(tests));
+
+    Ok(Value::Nil)
+}
+
+/// テストランナー: 登録されたテストを実行
+pub fn run_tests(env: &mut Env) -> Result<(usize, usize), LispError> {
+    let tests = if let Ok(Value::List(items)) = env.get("__tests__") {
+        items.to_vec()
+    } else {
+        return Ok((0, 0));
+    };
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for test_entry in &tests {
+        let items = test_entry.as_list()?;
+        let name = items[0].as_str()?;
+        let test_fn = &items[1];
+
+        match apply(test_fn, &[]) {
+            Ok(_) => {
+                println!("  ✓ {}", name);
+                passed += 1;
+            }
+            Err(e) => {
+                println!("  ✗ {}: {}", name, e);
+                failed += 1;
+            }
+        }
+    }
+
+    Ok((passed, failed))
 }
 
 /// (deftype Name (field1 field2 ...))
@@ -1696,6 +1758,44 @@ mod tests {
             eval_str("(def m {:name \"alice\"}) (.name m)").unwrap(),
             Value::str("alice")
         );
+    }
+
+    #[test]
+    fn test_deftest_assert_eq() {
+        let mut env = Env::new();
+        crate::builtins::register(&mut env);
+        let exprs = parse("(deftest test-add (assert= (+ 1 2) 3))").unwrap();
+        for expr in &exprs {
+            eval(expr, &mut env).unwrap();
+        }
+        let (passed, failed) = crate::eval::run_tests(&mut env).unwrap();
+        assert_eq!(passed, 1);
+        assert_eq!(failed, 0);
+    }
+
+    #[test]
+    fn test_deftest_failure() {
+        let mut env = Env::new();
+        crate::builtins::register(&mut env);
+        let exprs = parse("(deftest test-bad (assert= 1 2))").unwrap();
+        for expr in &exprs {
+            eval(expr, &mut env).unwrap();
+        }
+        let (passed, failed) = crate::eval::run_tests(&mut env).unwrap();
+        assert_eq!(passed, 0);
+        assert_eq!(failed, 1);
+    }
+
+    #[test]
+    fn test_assert_true() {
+        assert_eq!(eval_str("(assert-true true)").unwrap(), Value::Bool(true));
+        assert!(eval_str("(assert-true false)").is_err());
+    }
+
+    #[test]
+    fn test_assert_nil() {
+        assert_eq!(eval_str("(assert-nil nil)").unwrap(), Value::Bool(true));
+        assert!(eval_str("(assert-nil 42)").is_err());
     }
 
     fn eval_with_module_path(dir: &str, input: &str) -> LispResult {
