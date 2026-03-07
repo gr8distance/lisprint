@@ -13,6 +13,10 @@ pub fn registry() -> HashMap<&'static str, ModuleRegisterFn> {
     map.insert("str", str_mod::register);
     map.insert("fs", fs::register);
     map.insert("os", os::register);
+    map.insert("json", json::register);
+    map.insert("uuid", uuid_mod::register);
+    map.insert("time", time::register);
+    map.insert("re", re::register);
     map
 }
 
@@ -28,6 +32,10 @@ pub fn load_stdlib(name: &str, env: &mut Env) -> Result<bool, LispError> {
 }
 
 pub mod fs;
+pub mod json;
 pub mod math;
 pub mod os;
+pub mod re;
 pub mod str_mod;
+pub mod time;
+pub mod uuid_mod;

@@ -1864,6 +1864,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_require_stdlib_json() {
+        assert_eq!(
+            eval_str("(require 'json) (json/parse \"{\\\"name\\\":\\\"alice\\\",\\\"age\\\":30}\")").unwrap(),
+            {
+                let mut map = std::collections::HashMap::new();
+                map.insert("name".to_string(), Value::str("alice"));
+                map.insert("age".to_string(), Value::Int(30));
+                Value::Map(Arc::new(map))
+            }
+        );
+        assert_eq!(
+            eval_str("(require 'json) (json/encode {:name \"bob\"})").unwrap(),
+            Value::str("{\"name\":\"bob\"}")
+        );
+    }
+
+    #[test]
+    fn test_require_stdlib_uuid() {
+        let result = eval_str("(require 'uuid) (uuid/v4)").unwrap();
+        if let Value::Str(s) = &result {
+            assert_eq!(s.len(), 36); // UUID v4 format
+        } else {
+            panic!("expected string");
+        }
+    }
+
+    #[test]
+    fn test_require_stdlib_time() {
+        let result = eval_str("(require 'time) (time/now)").unwrap();
+        if let Value::Int(n) = result {
+            assert!(n > 1700000000); // after 2023
+        } else {
+            panic!("expected int");
+        }
+    }
+
+    #[test]
+    fn test_require_stdlib_re() {
+        assert_eq!(
+            eval_str("(require 're) (re/match? \"\\\\d+\" \"abc123\")").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_str("(require 're) (re/find \"\\\\d+\" \"abc123def\")").unwrap(),
+            Value::str("123")
+        );
+        assert_eq!(
+            eval_str("(require 're) (re/find-all \"\\\\d+\" \"a1b2c3\")").unwrap(),
+            Value::list(vec![Value::str("1"), Value::str("2"), Value::str("3")])
+        );
+    }
+
     fn eval_with_module_path(dir: &str, input: &str) -> LispResult {
         let exprs = parse(input).unwrap();
         let mut env = Env::new();

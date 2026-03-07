@@ -262,6 +262,7 @@ impl PartialEq for Value {
             (Value::Keyword(a), Value::Keyword(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Vec(a), Value::Vec(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
             (Value::TypeInstance(a), Value::TypeInstance(b)) => {
                 a.type_name == b.type_name && a.fields == b.fields
             }
