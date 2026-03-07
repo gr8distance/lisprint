@@ -1,7 +1,13 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::env::Env;
 use crate::value::{LispError, LispFn, LispResult, Value};
+
+thread_local! {
+    static LOADING_MODULES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
 
 /// 式を評価する
 pub fn eval(value: &Value, env: &mut Env) -> LispResult {
@@ -50,6 +56,8 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "throw" => return eval_throw(&items[1..], env),
             "try" => return eval_try(&items[1..], env),
             "with" => return eval_with(&items[1..], env),
+            "ns" => return eval_ns(&items[1..], env),
+            "require" => return eval_require(&items[1..], env),
             _ => {}
         }
     }
@@ -562,6 +570,214 @@ fn eval_with(args: &[Value], env: &mut Env) -> LispResult {
     eval(&body[body.len() - 1], &mut with_env)
 }
 
+/// (ns name (export sym1 sym2 ...))
+fn eval_ns(args: &[Value], env: &mut Env) -> LispResult {
+    if args.is_empty() {
+        return Err(LispError::new("ns requires a module name"));
+    }
+
+    let name = args[0].as_symbol()?;
+    env.define("__ns__", Value::symbol(name));
+
+    for clause in &args[1..] {
+        if let Value::List(items) = clause {
+            if !items.is_empty() {
+                if let Value::Symbol(s) = &items[0] {
+                    if s.as_str() == "export" {
+                        env.define("__exports__", Value::list(items[1..].to_vec()));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Value::Nil)
+}
+
+/// (require 'name) / (require 'name :as 'alias) / (require 'name :only '(sym1)) / (require 'name :all)
+fn eval_require(args: &[Value], env: &mut Env) -> LispResult {
+    if args.is_empty() {
+        return Err(LispError::new("require requires a module name"));
+    }
+
+    let mod_val = eval(&args[0], env)?;
+    let mod_name = match &mod_val {
+        Value::Symbol(s) => s.to_string(),
+        Value::Str(s) => s.to_string(),
+        _ => return Err(LispError::new("require: module name must be a symbol or string")),
+    };
+
+    // Parse options
+    let mut alias: Option<String> = None;
+    let mut only: Option<Vec<String>> = None;
+    let mut import_all = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        let kw = eval(&args[i], env)?;
+        match &kw {
+            Value::Keyword(k) => match k.as_str() {
+                "as" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(LispError::new("require :as expects a symbol"));
+                    }
+                    let alias_val = eval(&args[i], env)?;
+                    alias = Some(match &alias_val {
+                        Value::Symbol(s) => s.to_string(),
+                        _ => return Err(LispError::new("require :as expects a symbol")),
+                    });
+                }
+                "only" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(LispError::new("require :only expects a list"));
+                    }
+                    let only_val = eval(&args[i], env)?;
+                    let only_list = only_val.as_list()?;
+                    only = Some(
+                        only_list
+                            .iter()
+                            .map(|v| match v {
+                                Value::Symbol(s) => Ok(s.to_string()),
+                                _ => Err(LispError::new("require :only expects symbols")),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                }
+                "all" => {
+                    import_all = true;
+                }
+                other => return Err(LispError::new(format!("require: unknown option :{}", other))),
+            },
+            _ => return Err(LispError::new("require: options must be keywords")),
+        }
+        i += 1;
+    }
+
+    // Circular dependency check
+    LOADING_MODULES.with(|loading| {
+        if loading.borrow().contains(&mod_name) {
+            return Err(LispError::new(format!(
+                "circular dependency detected: '{}'",
+                mod_name
+            )));
+        }
+        loading.borrow_mut().insert(mod_name.clone());
+        Ok(())
+    })?;
+
+    let result = load_and_import_module(&mod_name, alias.as_deref(), only.as_deref(), import_all, env);
+
+    LOADING_MODULES.with(|loading| {
+        loading.borrow_mut().remove(&mod_name);
+    });
+
+    result
+}
+
+fn load_and_import_module(
+    mod_name: &str,
+    alias: Option<&str>,
+    only: Option<&[String]>,
+    import_all: bool,
+    env: &mut Env,
+) -> LispResult {
+    let file_path = resolve_module_path(mod_name, env)?;
+    let source = std::fs::read_to_string(&file_path)
+        .map_err(|e| LispError::new(format!("cannot load module '{}': {}", mod_name, e)))?;
+
+    let exprs = crate::parser::parse(&source)?;
+    let mut mod_env = Env::new();
+    crate::builtins::register(&mut mod_env);
+    crate::prelude::load(&mut mod_env)?;
+    for expr in &exprs {
+        eval(expr, &mut mod_env)?;
+    }
+
+    let exports = get_module_exports(&mod_env);
+
+    if let Some(only_names) = only {
+        for name in only_names {
+            if !exports.contains(name) {
+                return Err(LispError::new(format!(
+                    "module '{}' does not export '{}'",
+                    mod_name, name
+                )));
+            }
+            if let Ok(val) = mod_env.get(name) {
+                env.define(name.clone(), val);
+            }
+        }
+    } else if import_all {
+        for name in &exports {
+            if let Ok(val) = mod_env.get(name) {
+                env.define(name.clone(), val);
+            }
+        }
+    } else {
+        let prefix = alias.unwrap_or(mod_name);
+        for name in &exports {
+            if let Ok(val) = mod_env.get(name) {
+                env.define(format!("{}/{}", prefix, name), val);
+            }
+        }
+    }
+
+    Ok(Value::Nil)
+}
+
+fn resolve_module_path(name: &str, env: &Env) -> Result<String, LispError> {
+    let sep = std::path::MAIN_SEPARATOR;
+    let file_name = format!("{}.lisp", name.replace('/', &sep.to_string()));
+
+    // __module_path__ が設定されていればそれを基準にする
+    if let Ok(base_val) = env.get("__module_path__") {
+        if let Value::Str(base) = &base_val {
+            let path = format!("{}{}{}", base, sep, file_name);
+            if std::path::Path::new(&path).exists() {
+                return Ok(path);
+            }
+        }
+    }
+
+    let candidates = vec![
+        file_name.clone(),
+        format!("src{}{}", sep, file_name),
+        format!("lib{}{}", sep, file_name),
+    ];
+
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return Ok(path.clone());
+        }
+    }
+
+    Err(LispError::new(format!(
+        "module '{}' not found (tried: {})",
+        name,
+        candidates.join(", ")
+    )))
+}
+
+fn get_module_exports(env: &Env) -> Vec<String> {
+    if let Ok(exports_val) = env.get("__exports__") {
+        if let Value::List(items) = &exports_val {
+            return items
+                .iter()
+                .filter_map(|v| {
+                    if let Value::Symbol(s) = v {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+    }
+    vec![]
+}
+
 // --- ヘルパー ---
 
 fn parse_params(value: &Value) -> Result<Vec<String>, LispError> {
@@ -906,5 +1122,115 @@ mod tests {
             eval_with_prelude("(flatten '(1 (2 3) (4 (5))))").unwrap(),
             Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5)])
         );
+    }
+
+    // --- ns / require tests ---
+
+    #[test]
+    fn test_ns_export() {
+        // ns + export + defun が動くことを確認
+        assert_eq!(
+            eval_str("(ns mymod (export add)) (defun add (a b) (+ a b)) (add 1 2)").unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    fn eval_with_module_path(dir: &str, input: &str) -> LispResult {
+        let exprs = parse(input).unwrap();
+        let mut env = Env::new();
+        crate::builtins::register(&mut env);
+        env.define("__module_path__", Value::str(dir));
+        let mut result = Value::Nil;
+        for expr in &exprs {
+            result = eval(expr, &mut env)?;
+        }
+        Ok(result)
+    }
+
+    #[test]
+    fn test_require_module() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("lisprint_test_require");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mod_file = dir.join("testmod.lisp");
+        let mut f = std::fs::File::create(&mod_file).unwrap();
+        writeln!(f, "(ns testmod (export greet))").unwrap();
+        writeln!(f, "(defun greet (name) (str \"hello \" name))").unwrap();
+        writeln!(f, "(defun internal () 42)").unwrap();
+
+        let result = eval_with_module_path(
+            dir.to_str().unwrap(),
+            "(require 'testmod) (testmod/greet \"world\")",
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(result.unwrap(), Value::str("hello world"));
+    }
+
+    #[test]
+    fn test_require_as() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("lisprint_test_require_as");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mod_file = dir.join("mymath.lisp");
+        let mut f = std::fs::File::create(&mod_file).unwrap();
+        writeln!(f, "(ns mymath (export double))").unwrap();
+        writeln!(f, "(defun double (n) (* n 2))").unwrap();
+
+        let result = eval_with_module_path(
+            dir.to_str().unwrap(),
+            "(require 'mymath :as 'm) (m/double 21)",
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(result.unwrap(), Value::Int(42));
+    }
+
+    #[test]
+    fn test_require_only() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("lisprint_test_require_only");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mod_file = dir.join("utils.lisp");
+        let mut f = std::fs::File::create(&mod_file).unwrap();
+        writeln!(f, "(ns utils (export triple square))").unwrap();
+        writeln!(f, "(defun triple (n) (* n 3))").unwrap();
+        writeln!(f, "(defun square (n) (* n n))").unwrap();
+
+        let result = eval_with_module_path(
+            dir.to_str().unwrap(),
+            "(require 'utils :only '(triple)) (triple 4)",
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(result.unwrap(), Value::Int(12));
+    }
+
+    #[test]
+    fn test_require_all() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("lisprint_test_require_all");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mod_file = dir.join("helpers.lisp");
+        let mut f = std::fs::File::create(&mod_file).unwrap();
+        writeln!(f, "(ns helpers (export add10 add20))").unwrap();
+        writeln!(f, "(defun add10 (n) (+ n 10))").unwrap();
+        writeln!(f, "(defun add20 (n) (+ n 20))").unwrap();
+
+        let result = eval_with_module_path(
+            dir.to_str().unwrap(),
+            "(require 'helpers :all) (+ (add10 1) (add20 2))",
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(result.unwrap(), Value::Int(33));
     }
 }
