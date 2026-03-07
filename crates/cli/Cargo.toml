@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 lisprint-core = { path = "../core" }
+lisprint-compiler = { path = "../compiler" }
 rustyline = "15"
