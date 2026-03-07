@@ -1,0 +1,11 @@
+[package]
+name = "lisprint"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lisprint"
+path = "src/main.rs"
+
+[dependencies]
+lisprint-core = { path = "../core" }
