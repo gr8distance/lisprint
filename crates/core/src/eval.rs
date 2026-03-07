@@ -1077,6 +1077,11 @@ fn load_and_import_module(
     import_all: bool,
     env: &mut Env,
 ) -> LispResult {
+    // まずstdlibレジストリを確認
+    if crate::stdlib::load_stdlib(mod_name, env)? {
+        return Ok(Value::Nil);
+    }
+
     let file_path = resolve_module_path(mod_name, env)?;
     let source = std::fs::read_to_string(&file_path)
         .map_err(|e| LispError::new(format!("cannot load module '{}': {}", mod_name, e)))?;
@@ -1796,6 +1801,38 @@ mod tests {
     fn test_assert_nil() {
         assert_eq!(eval_str("(assert-nil nil)").unwrap(), Value::Bool(true));
         assert!(eval_str("(assert-nil 42)").is_err());
+    }
+
+    #[test]
+    fn test_require_stdlib_math() {
+        assert_eq!(
+            eval_str("(require 'math) (math/abs -5)").unwrap(),
+            Value::Int(5)
+        );
+        assert_eq!(
+            eval_str("(require 'math) (math/sqrt 9.0)").unwrap(),
+            Value::Float(3.0)
+        );
+        assert_eq!(
+            eval_str("(require 'math) (math/max 3 7 2)").unwrap(),
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn test_require_stdlib_str() {
+        assert_eq!(
+            eval_str("(require 'str) (str/upper \"hello\")").unwrap(),
+            Value::str("HELLO")
+        );
+        assert_eq!(
+            eval_str("(require 'str) (str/split \"a,b,c\" \",\")").unwrap(),
+            Value::list(vec![Value::str("a"), Value::str("b"), Value::str("c")])
+        );
+        assert_eq!(
+            eval_str("(require 'str) (str/join \"-\" '(\"x\" \"y\" \"z\"))").unwrap(),
+            Value::str("x-y-z")
+        );
     }
 
     fn eval_with_module_path(dir: &str, input: &str) -> LispResult {
