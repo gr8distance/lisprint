@@ -58,6 +58,8 @@ pub struct Compiler {
     /// Declared functions: name → (FuncId, param_count)
     functions: HashMap<String, (FuncId, usize)>,
     next_func_idx: u32,
+    /// Bridge (runtime) functions: name → FuncId
+    bridges: HashMap<String, FuncId>,
 }
 
 impl Compiler {
@@ -84,15 +86,60 @@ impl Compiler {
         let ctx = module.make_context();
         let func_ctx = FunctionBuilderContext::new();
 
-        Ok(Self {
+        let mut compiler = Self {
             module,
             ctx,
             func_ctx,
             strings: HashMap::new(),
             next_str_id: 0,
             functions: HashMap::new(),
-            next_func_idx: 1, // 0 is reserved for _lsp_main
-        })
+            next_func_idx: 1,
+            bridges: HashMap::new(),
+        };
+        compiler.declare_bridges()?;
+        Ok(compiler)
+    }
+
+    /// Declare external runtime (bridge) functions
+    fn declare_bridges(&mut self) -> Result<(), String> {
+        // lsp_println(tag: i64, payload: i64) -> void
+        let mut sig_println = self.module.make_signature();
+        sig_println.params.push(AbiParam::new(types::I64));
+        sig_println.params.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_println", Linkage::Import, &sig_println)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("println".to_string(), id);
+
+        // lsp_print(tag: i64, payload: i64) -> void
+        let mut sig_print = self.module.make_signature();
+        sig_print.params.push(AbiParam::new(types::I64));
+        sig_print.params.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_print", Linkage::Import, &sig_print)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("print".to_string(), id);
+
+        // lsp_str_concat(tag1, payload1, tag2, payload2) -> (tag, payload)
+        let mut sig_concat = self.module.make_signature();
+        for _ in 0..4 {
+            sig_concat.params.push(AbiParam::new(types::I64));
+        }
+        sig_concat.returns.push(AbiParam::new(types::I64));
+        sig_concat.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_str_concat", Linkage::Import, &sig_concat)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("str".to_string(), id);
+
+        // lsp_to_string(tag, payload) -> (tag, payload)
+        let mut sig_tostr = self.module.make_signature();
+        sig_tostr.params.push(AbiParam::new(types::I64));
+        sig_tostr.params.push(AbiParam::new(types::I64));
+        sig_tostr.returns.push(AbiParam::new(types::I64));
+        sig_tostr.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_to_string", Linkage::Import, &sig_tostr)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("to-string".to_string(), id);
+
+        Ok(())
     }
 
     fn ensure_string(&mut self, s: &str) -> Result<DataId, String> {
@@ -222,6 +269,7 @@ impl Compiler {
                     &self.strings,
                     &self.functions,
                     &mut scope,
+                    &self.bridges,
                 )?;
                 last_tag = tag;
                 last_payload = payload;
@@ -244,6 +292,7 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         match expr {
             // Literals
@@ -299,15 +348,16 @@ impl Compiler {
                 // Check for special forms
                 if let Value::Symbol(sym) = &items[0] {
                     match sym.as_str() {
-                        "def" => return Self::emit_def(&items[1..], builder, module, strings, functions, scope),
-                        "do" => return Self::emit_do(&items[1..], builder, module, strings, functions, scope),
-                        "if" => return Self::emit_if(&items[1..], builder, module, strings, functions, scope),
-                        "let" => return Self::emit_let(&items[1..], builder, module, strings, functions, scope),
+                        "def" => return Self::emit_def(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "do" => return Self::emit_do(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "if" => return Self::emit_if(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "let" => return Self::emit_let(&items[1..], builder, module, strings, functions, scope, bridges),
                         "+" | "-" | "*" | "/" | "%" =>
-                            return Self::emit_arith(sym.as_str(), &items[1..], builder, module, strings, functions, scope),
+                            return Self::emit_arith(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
                         "=" | "<" | ">" | "<=" | ">=" | "!=" =>
-                            return Self::emit_cmp(sym.as_str(), &items[1..], builder, module, strings, functions, scope),
-                        "not" => return Self::emit_not(&items[1..], builder, module, strings, functions, scope),
+                            return Self::emit_cmp(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
+                        "not" => return Self::emit_not(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "println" | "print" => return Self::emit_bridge_io(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
                         "defun" => {
                             let tag = builder.ins().iconst(types::I64, TAG_NIL);
                             let payload = builder.ins().iconst(types::I64, 0);
@@ -330,7 +380,7 @@ impl Compiler {
                         let mut call_args = Vec::new();
                         for arg_expr in args_exprs {
                             let (tag, payload) = Self::emit_expr(
-                                arg_expr, builder, module, strings, functions, scope,
+                                arg_expr, builder, module, strings, functions, scope, bridges,
                             )?;
                             call_args.push(tag);
                             call_args.push(payload);
@@ -360,12 +410,13 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 2 {
             return Err("def requires 2 arguments (name value)".to_string());
         }
         let name = args[0].as_symbol().map_err(|e| e.to_string())?;
-        let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+        let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
         let (tag_var, payload_var) = scope.declare_var(name, builder);
         builder.def_var(tag_var, tag);
         builder.def_var(payload_var, payload);
@@ -380,12 +431,13 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() < 2 || args.len() > 3 {
             return Err("if requires 2 or 3 arguments".to_string());
         }
 
-        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
+        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
 
         // Truthy: not nil (tag!=0) and not false (tag==1 && payload==0)
         // Falsy: nil (tag==0) OR (tag==1 AND payload==0)
@@ -407,14 +459,14 @@ impl Compiler {
         // Then branch
         builder.switch_to_block(then_block);
         builder.seal_block(then_block);
-        let (then_tag, then_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+        let (then_tag, then_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
         builder.ins().jump(merge_block, &[then_tag, then_payload]);
 
         // Else branch
         builder.switch_to_block(else_block);
         builder.seal_block(else_block);
         let (else_tag, else_payload) = if args.len() == 3 {
-            Self::emit_expr(&args[2], builder, module, strings, functions, scope)?
+            Self::emit_expr(&args[2], builder, module, strings, functions, scope, bridges)?
         } else {
             let t = builder.ins().iconst(types::I64, TAG_NIL);
             let p = builder.ins().iconst(types::I64, 0);
@@ -438,6 +490,7 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.is_empty() {
             return Err("let requires bindings and body".to_string());
@@ -454,7 +507,7 @@ impl Compiler {
 
         for chunk in bindings.chunks(2) {
             let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
-            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope)?;
+            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
             let (tag_var, payload_var) = scope.declare_var(name, builder);
             builder.def_var(tag_var, tag);
             builder.def_var(payload_var, payload);
@@ -464,7 +517,7 @@ impl Compiler {
         let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
         let mut last_payload = builder.ins().iconst(types::I64, 0);
         for expr in body {
-            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope)?;
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges)?;
             last_tag = tag;
             last_payload = payload;
         }
@@ -480,12 +533,13 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 2 {
             return Err(format!("{} requires 2 arguments", op));
         }
-        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
-        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
 
         let result = match op {
             "+" => builder.ins().iadd(lhs, rhs),
@@ -509,12 +563,13 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 2 {
             return Err(format!("{} requires 2 arguments", op));
         }
-        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
-        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
 
         use cranelift_codegen::ir::condcodes::IntCC;
         let cc = match op {
@@ -541,11 +596,12 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 1 {
             return Err("not requires 1 argument".to_string());
         }
-        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
+        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
 
         // Falsy = nil or false
         let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
@@ -558,6 +614,31 @@ impl Compiler {
         Ok((tag, payload))
     }
 
+    /// (println expr) / (print expr) — bridge call to runtime
+    fn emit_bridge_io(
+        name: &str,
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() != 1 {
+            return Err(format!("{} requires 1 argument", name));
+        }
+        let (tag, payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let bridge_id = bridges.get(name)
+            .ok_or_else(|| format!("bridge function {} not found", name))?;
+        let local_func = module.declare_func_in_func(*bridge_id, builder.func);
+        builder.ins().call(local_func, &[tag, payload]);
+
+        let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let nil_payload = builder.ins().iconst(types::I64, 0);
+        Ok((nil_tag, nil_payload))
+    }
+
     /// (do expr1 expr2 ...)
     fn emit_do(
         args: &[Value],
@@ -566,11 +647,12 @@ impl Compiler {
         strings: &HashMap<String, DataId>,
         functions: &HashMap<String, (FuncId, usize)>,
         scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
         let mut last_payload = builder.ins().iconst(types::I64, 0);
         for expr in args {
-            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope)?;
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges)?;
             last_tag = tag;
             last_payload = payload;
         }
@@ -648,6 +730,7 @@ impl Compiler {
                     &self.strings,
                     &self.functions,
                     &mut scope,
+                    &self.bridges,
                 )?;
                 last_tag = tag;
                 last_payload = payload;
@@ -809,6 +892,18 @@ mod tests {
     fn test_compile_factorial() {
         // Recursive factorial
         let exprs = parse("(defun fact (n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 5)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_println() {
+        let exprs = parse("(println 42)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_println_string() {
+        let exprs = parse("(println \"hello\")").unwrap();
         assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
     }
 
