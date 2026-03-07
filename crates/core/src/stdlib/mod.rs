@@ -11,6 +11,8 @@ pub fn registry() -> HashMap<&'static str, ModuleRegisterFn> {
     let mut map: HashMap<&'static str, ModuleRegisterFn> = HashMap::new();
     map.insert("math", math::register);
     map.insert("str", str_mod::register);
+    map.insert("fs", fs::register);
+    map.insert("os", os::register);
     map
 }
 
@@ -21,9 +23,11 @@ pub fn load_stdlib(name: &str, env: &mut Env) -> Result<bool, LispError> {
         register_fn(env);
         Ok(true)
     } else {
-        Ok(false) // 見つからなければfalse (ファイルから探す)
+        Ok(false)
     }
 }
 
+pub mod fs;
 pub mod math;
+pub mod os;
 pub mod str_mod;

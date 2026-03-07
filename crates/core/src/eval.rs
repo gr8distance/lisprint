@@ -1835,6 +1835,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_require_stdlib_fs() {
+        let dir = std::env::temp_dir().join("lisprint_test_fs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let test_file = dir.join("test.txt");
+
+        let result = eval_str(&format!(
+            "(require 'fs) (fs/write \"{}\" \"hello\") (fs/read \"{}\")",
+            test_file.display(), test_file.display()
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result.unwrap(), Value::str("hello"));
+    }
+
+    #[test]
+    fn test_require_stdlib_os() {
+        assert_eq!(
+            eval_str("(require 'os) (env/get \"PATH\")").unwrap().type_name(),
+            "string"
+        );
+        // path/join
+        assert!(eval_str("(require 'os) (path/join \"/tmp\" \"test\")").is_ok());
+        // path/basename
+        assert_eq!(
+            eval_str("(require 'os) (path/basename \"/tmp/foo.txt\")").unwrap(),
+            Value::str("foo.txt")
+        );
+    }
+
     fn eval_with_module_path(dir: &str, input: &str) -> LispResult {
         let exprs = parse(input).unwrap();
         let mut env = Env::new();
