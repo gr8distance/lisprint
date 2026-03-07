@@ -18,6 +18,7 @@ pub fn registry() -> HashMap<&'static str, ModuleRegisterFn> {
     map.insert("time", time::register);
     map.insert("re", re::register);
     map.insert("http", http::register);
+    map.insert("http/server", http_server::register);
     map
 }
 
@@ -34,6 +35,7 @@ pub fn load_stdlib(name: &str, env: &mut Env) -> Result<bool, LispError> {
 
 pub mod fs;
 pub mod http;
+pub mod http_server;
 pub mod json;
 pub mod math;
 pub mod os;

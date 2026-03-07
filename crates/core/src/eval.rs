@@ -1919,10 +1919,15 @@ mod tests {
 
     #[test]
     fn test_require_stdlib_http() {
-        // Just verify the module loads and functions are defined
         let result = eval_str("(require 'http) (fn? http/get)").unwrap();
         assert_eq!(result, Value::Bool(true));
         let result = eval_str("(require 'http) (fn? http/post)").unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_require_stdlib_http_server() {
+        let result = eval_str("(require 'http/server) (fn? server/start)").unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
