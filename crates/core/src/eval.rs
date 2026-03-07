@@ -43,6 +43,7 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "let" => return eval_let(&items[1..], env),
             "do" => return eval_do(&items[1..], env),
             "quote" => return eval_quote(&items[1..]),
+            "quasiquote" => return eval_quasiquote(&items[1..], env),
             "loop" => return eval_loop(&items[1..], env),
             _ => {}
         }
@@ -211,6 +212,57 @@ fn eval_quote(args: &[Value]) -> LispResult {
         return Err(LispError::new("quote requires exactly 1 argument"));
     }
     Ok(args[0].clone())
+}
+
+/// (quasiquote expr) — ` 記法
+fn eval_quasiquote(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() != 1 {
+        return Err(LispError::new("quasiquote requires exactly 1 argument"));
+    }
+    expand_quasiquote(&args[0], env)
+}
+
+fn expand_quasiquote(value: &Value, env: &mut Env) -> LispResult {
+    match value {
+        Value::List(items) => {
+            if items.is_empty() {
+                return Ok(Value::list(vec![]));
+            }
+
+            // (unquote expr) → eval expr
+            if let Value::Symbol(s) = &items[0] {
+                if s.as_str() == "unquote" {
+                    if items.len() != 2 {
+                        return Err(LispError::new("unquote requires exactly 1 argument"));
+                    }
+                    return eval(&items[1], env);
+                }
+            }
+
+            // 各要素を展開、splice-unquoteを処理
+            let mut result = Vec::new();
+            for item in items.iter() {
+                if let Value::List(inner) = item {
+                    if !inner.is_empty() {
+                        if let Value::Symbol(s) = &inner[0] {
+                            if s.as_str() == "splice-unquote" {
+                                if inner.len() != 2 {
+                                    return Err(LispError::new("splice-unquote requires exactly 1 argument"));
+                                }
+                                let val = eval(&inner[1], env)?;
+                                let spliced = val.as_list()?;
+                                result.extend_from_slice(spliced);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                result.push(expand_quasiquote(item, env)?);
+            }
+            Ok(Value::list(result))
+        }
+        _ => Ok(value.clone()),
+    }
 }
 
 /// (loop [bindings...] body...)
@@ -462,6 +514,30 @@ mod tests {
         assert_eq!(
             eval_str("(loop [i 0 acc 0] (if (= i 5) acc (recur (+ i 1) (+ acc i))))").unwrap(),
             Value::Int(10) // 0+1+2+3+4
+        );
+    }
+
+    #[test]
+    fn test_eval_quasiquote() {
+        assert_eq!(
+            eval_str("`(1 2 3)").unwrap(),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    #[test]
+    fn test_eval_unquote() {
+        assert_eq!(
+            eval_str("(def x 42) `(a ~x b)").unwrap(),
+            Value::list(vec![Value::symbol("a"), Value::Int(42), Value::symbol("b")])
+        );
+    }
+
+    #[test]
+    fn test_eval_splice_unquote() {
+        assert_eq!(
+            eval_str("(def xs '(2 3)) `(1 ~@xs 4)").unwrap(),
+            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])
         );
     }
 
