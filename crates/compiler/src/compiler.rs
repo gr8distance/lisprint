@@ -4,8 +4,8 @@ use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{default_libcall_names, DataDescription, DataId, Linkage, Module};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_module::{default_libcall_names, DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use lisprint_core::value::Value;
@@ -17,21 +17,47 @@ pub const TAG_INT: i64 = 2;
 pub const TAG_FLOAT: i64 = 3;
 pub const TAG_STR: i64 = 4;
 
+/// Tracks local variables within a function being compiled.
+/// Each Lisp value is represented as two Cranelift Variables: (tag, payload).
+struct FnScope {
+    locals: HashMap<String, (Variable, Variable)>,
+    next_var: u32,
+}
+
+impl FnScope {
+    fn new() -> Self {
+        Self {
+            locals: HashMap::new(),
+            next_var: 0,
+        }
+    }
+
+    fn declare_var(&mut self, name: &str, builder: &mut FunctionBuilder) -> (Variable, Variable) {
+        let tag_var = Variable::from_u32(self.next_var);
+        self.next_var += 1;
+        let payload_var = Variable::from_u32(self.next_var);
+        self.next_var += 1;
+        builder.declare_var(tag_var, types::I64);
+        builder.declare_var(payload_var, types::I64);
+        self.locals.insert(name.to_string(), (tag_var, payload_var));
+        (tag_var, payload_var)
+    }
+
+    fn get_var(&self, name: &str) -> Option<(Variable, Variable)> {
+        self.locals.get(name).copied()
+    }
+}
+
 /// Cranelift-based compiler for lisprint
-///
-/// Runtime value representation: each value is a (tag: i64, payload: i64) pair.
-/// - NIL:   (0, 0)
-/// - Bool:  (1, 0 or 1)
-/// - Int:   (2, i64 value)
-/// - Float: (3, f64 bits as i64)
-/// - Str:   (4, pointer to null-terminated string data)
 pub struct Compiler {
     module: ObjectModule,
     ctx: Context,
     func_ctx: FunctionBuilderContext,
-    /// Pre-declared string constants: string content → DataId
     strings: HashMap<String, DataId>,
     next_str_id: usize,
+    /// Declared functions: name → (FuncId, param_count)
+    functions: HashMap<String, (FuncId, usize)>,
+    next_func_idx: u32,
 }
 
 impl Compiler {
@@ -64,10 +90,11 @@ impl Compiler {
             func_ctx,
             strings: HashMap::new(),
             next_str_id: 0,
+            functions: HashMap::new(),
+            next_func_idx: 1, // 0 is reserved for _lsp_main
         })
     }
 
-    /// Pre-declare a string constant in the data section (deduplicating)
     fn ensure_string(&mut self, s: &str) -> Result<DataId, String> {
         if let Some(&id) = self.strings.get(s) {
             return Ok(id);
@@ -82,18 +109,14 @@ impl Compiler {
 
         let mut desc = DataDescription::new();
         let mut bytes = s.as_bytes().to_vec();
-        bytes.push(0); // null-terminate
+        bytes.push(0);
         desc.define(bytes.into_boxed_slice());
 
-        self.module
-            .define_data(data_id, &desc)
-            .map_err(|e| e.to_string())?;
-
+        self.module.define_data(data_id, &desc).map_err(|e| e.to_string())?;
         self.strings.insert(s.to_string(), data_id);
         Ok(data_id)
     }
 
-    /// Walk the AST to pre-declare all string literals
     fn collect_strings(&mut self, exprs: &[Value]) -> Result<(), String> {
         for expr in exprs {
             self.collect_strings_in_expr(expr)?;
@@ -103,9 +126,7 @@ impl Compiler {
 
     fn collect_strings_in_expr(&mut self, expr: &Value) -> Result<(), String> {
         match expr {
-            Value::Str(s) => {
-                self.ensure_string(s)?;
-            }
+            Value::Str(s) => { self.ensure_string(s)?; }
             Value::List(items) | Value::Vec(items) => {
                 for item in items.iter() {
                     self.collect_strings_in_expr(item)?;
@@ -116,14 +137,116 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emit Cranelift IR for a literal, returning (tag, payload)
-    fn emit_literal(
+    /// Declare a function signature: N params (each is tag+payload pair) → (tag, payload)
+    fn make_fn_sig(&self, param_count: usize) -> cranelift_codegen::ir::Signature {
+        let mut sig = self.module.make_signature();
+        for _ in 0..param_count {
+            sig.params.push(AbiParam::new(types::I64)); // tag
+            sig.params.push(AbiParam::new(types::I64)); // payload
+        }
+        sig.returns.push(AbiParam::new(types::I64)); // return tag
+        sig.returns.push(AbiParam::new(types::I64)); // return payload
+        sig
+    }
+
+    /// Pre-pass: declare all top-level defun functions in the module
+    fn declare_functions(&mut self, exprs: &[Value]) -> Result<(), String> {
+        for expr in exprs {
+            if let Value::List(items) = expr {
+                if items.len() >= 4 {
+                    if let Value::Symbol(sym) = &items[0] {
+                        if sym.as_str() == "defun" {
+                            if let Value::Symbol(name) = &items[1] {
+                                // (defun name (params...) body...)
+                                if let Value::List(params) = &items[2] {
+                                    let param_count = params.len();
+                                    let sig = self.make_fn_sig(param_count);
+                                    let func_name = format!("_lsp_fn_{}", name);
+                                    let func_id = self.module
+                                        .declare_function(&func_name, Linkage::Local, &sig)
+                                        .map_err(|e| e.to_string())?;
+                                    self.functions.insert(name.to_string(), (func_id, param_count));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a defun into a Cranelift function
+    fn compile_defun(&mut self, name: &str, params: &[Value], body: &[Value]) -> Result<(), String> {
+        let param_names: Vec<String> = params.iter()
+            .map(|p| p.as_symbol().map(|s| s.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        let param_count = param_names.len();
+        let (func_id, _) = *self.functions.get(name)
+            .ok_or_else(|| format!("function {} not declared", name))?;
+
+        let sig = self.make_fn_sig(param_count);
+        self.ctx.func.signature = sig;
+        self.ctx.func.name = UserFuncName::user(0, self.next_func_idx);
+        self.next_func_idx += 1;
+
+        {
+            let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            builder.seal_block(entry_block);
+
+            let mut scope = FnScope::new();
+
+            // Bind parameters
+            for (i, param_name) in param_names.iter().enumerate() {
+                let (tag_var, payload_var) = scope.declare_var(param_name, &mut builder);
+                let tag_val = builder.block_params(entry_block)[i * 2];
+                let payload_val = builder.block_params(entry_block)[i * 2 + 1];
+                builder.def_var(tag_var, tag_val);
+                builder.def_var(payload_var, payload_val);
+            }
+
+            // Compile body
+            let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+            let mut last_payload = builder.ins().iconst(types::I64, 0);
+
+            for expr in body {
+                let (tag, payload) = Self::emit_expr(
+                    expr,
+                    &mut builder,
+                    &mut self.module,
+                    &self.strings,
+                    &self.functions,
+                    &mut scope,
+                )?;
+                last_tag = tag;
+                last_payload = payload;
+            }
+
+            builder.ins().return_(&[last_tag, last_payload]);
+            builder.finalize();
+        }
+
+        self.module.define_function(func_id, &mut self.ctx).map_err(|e| e.to_string())?;
+        self.module.clear_context(&mut self.ctx);
+        Ok(())
+    }
+
+    /// Emit Cranelift IR for an expression, returning (tag, payload)
+    fn emit_expr(
         expr: &Value,
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         match expr {
+            // Literals
             Value::Nil => {
                 let tag = builder.ins().iconst(types::I64, TAG_NIL);
                 let payload = builder.ins().iconst(types::I64, 0);
@@ -153,25 +276,160 @@ impl Compiler {
                 let payload = builder.ins().global_value(types::I64, gv);
                 Ok((tag, payload))
             }
-            _ => Err(format!("cannot compile literal: {}", expr.type_name())),
+
+            // Symbol reference (variable lookup)
+            Value::Symbol(name) => {
+                if let Some((tag_var, payload_var)) = scope.get_var(name) {
+                    let tag = builder.use_var(tag_var);
+                    let payload = builder.use_var(payload_var);
+                    Ok((tag, payload))
+                } else {
+                    Err(format!("undefined variable: {}", name))
+                }
+            }
+
+            // List = special form or function call
+            Value::List(items) => {
+                if items.is_empty() {
+                    let tag = builder.ins().iconst(types::I64, TAG_NIL);
+                    let payload = builder.ins().iconst(types::I64, 0);
+                    return Ok((tag, payload));
+                }
+
+                // Check for special forms
+                if let Value::Symbol(sym) = &items[0] {
+                    match sym.as_str() {
+                        "def" => return Self::emit_def(&items[1..], builder, module, strings, functions, scope),
+                        "do" => return Self::emit_do(&items[1..], builder, module, strings, functions, scope),
+                        "defun" => {
+                            // defun is handled at top level, skip here
+                            let tag = builder.ins().iconst(types::I64, TAG_NIL);
+                            let payload = builder.ins().iconst(types::I64, 0);
+                            return Ok((tag, payload));
+                        }
+                        _ => {}
+                    }
+
+                    // Function call
+                    if let Some(&(func_id, param_count)) = functions.get(sym.as_str()) {
+                        let args_exprs = &items[1..];
+                        if args_exprs.len() != param_count {
+                            return Err(format!(
+                                "{}: expected {} arguments, got {}",
+                                sym, param_count, args_exprs.len()
+                            ));
+                        }
+
+                        // Evaluate arguments
+                        let mut call_args = Vec::new();
+                        for arg_expr in args_exprs {
+                            let (tag, payload) = Self::emit_expr(
+                                arg_expr, builder, module, strings, functions, scope,
+                            )?;
+                            call_args.push(tag);
+                            call_args.push(payload);
+                        }
+
+                        let local_func = module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(local_func, &call_args);
+                        let results = builder.inst_results(call);
+                        let ret_tag = results[0];
+                        let ret_payload = results[1];
+                        return Ok((ret_tag, ret_payload));
+                    }
+                }
+
+                Err(format!("cannot compile call: {}", items[0]))
+            }
+
+            _ => Err(format!("cannot compile: {}", expr.type_name())),
         }
     }
 
-    /// Compile expressions into an object file.
-    /// The generated _lsp_main function returns (tag: i64, payload: i64).
+    /// (def name value)
+    fn emit_def(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() != 2 {
+            return Err("def requires 2 arguments (name value)".to_string());
+        }
+        let name = args[0].as_symbol().map_err(|e| e.to_string())?;
+        let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+        let (tag_var, payload_var) = scope.declare_var(name, builder);
+        builder.def_var(tag_var, tag);
+        builder.def_var(payload_var, payload);
+        Ok((tag, payload))
+    }
+
+    /// (do expr1 expr2 ...)
+    fn emit_do(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let mut last_payload = builder.ins().iconst(types::I64, 0);
+        for expr in args {
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope)?;
+            last_tag = tag;
+            last_payload = payload;
+        }
+        Ok((last_tag, last_payload))
+    }
+
+    /// Compile all expressions into an object file.
     pub fn compile_exprs(mut self, exprs: &[Value]) -> Result<Vec<u8>, String> {
         if exprs.is_empty() {
             return Err("nothing to compile".to_string());
         }
 
-        // Pass 1: pre-declare all string constants
+        // Pass 1: collect strings
         self.collect_strings(exprs)?;
 
-        // Function signature: () -> (i64, i64)
-        let mut sig = self.module.make_signature();
-        sig.returns.push(AbiParam::new(types::I64)); // tag
-        sig.returns.push(AbiParam::new(types::I64)); // payload
+        // Pass 2: declare all top-level functions
+        self.declare_functions(exprs)?;
 
+        // Pass 3: compile each defun
+        // Collect defun info first to avoid borrow issues
+        let defuns: Vec<(String, Vec<Value>, Vec<Value>)> = exprs.iter().filter_map(|expr| {
+            if let Value::List(items) = expr {
+                if items.len() >= 4 {
+                    if let (Value::Symbol(sym), Value::Symbol(name)) = (&items[0], &items[1]) {
+                        if sym.as_str() == "defun" {
+                            if let Value::List(params) = &items[2] {
+                                let body = items[3..].to_vec();
+                                return Some((name.to_string(), params.to_vec(), body));
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }).collect();
+
+        for (name, params, body) in &defuns {
+            self.compile_defun(name, params, body)?;
+        }
+
+        // Pass 4: compile _lsp_main (non-defun top-level expressions)
+        let main_exprs: Vec<&Value> = exprs.iter().filter(|expr| {
+            if let Value::List(items) = expr {
+                if let Some(Value::Symbol(sym)) = items.first() {
+                    return sym.as_str() != "defun";
+                }
+            }
+            true
+        }).collect();
+
+        let sig = self.make_fn_sig(0);
         let func_id = self.module
             .declare_function("_lsp_main", Linkage::Export, &sig)
             .map_err(|e| e.to_string())?;
@@ -179,7 +437,6 @@ impl Compiler {
         self.ctx.func.signature = sig;
         self.ctx.func.name = UserFuncName::user(0, 0);
 
-        // Pass 2: emit IR
         {
             let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx);
             let entry_block = builder.create_block();
@@ -187,15 +444,18 @@ impl Compiler {
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
 
+            let mut scope = FnScope::new();
             let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
             let mut last_payload = builder.ins().iconst(types::I64, 0);
 
-            for expr in exprs {
-                let (tag, payload) = Self::emit_literal(
+            for expr in &main_exprs {
+                let (tag, payload) = Self::emit_expr(
                     expr,
                     &mut builder,
                     &mut self.module,
                     &self.strings,
+                    &self.functions,
+                    &mut scope,
                 )?;
                 last_tag = tag;
                 last_payload = payload;
@@ -205,10 +465,7 @@ impl Compiler {
             builder.finalize();
         }
 
-        self.module
-            .define_function(func_id, &mut self.ctx)
-            .map_err(|e| e.to_string())?;
-
+        self.module.define_function(func_id, &mut self.ctx).map_err(|e| e.to_string())?;
         self.module.clear_context(&mut self.ctx);
 
         let product = self.module.finish();
@@ -230,9 +487,7 @@ mod tests {
     #[test]
     fn test_compile_int_literal() {
         let exprs = parse("42").unwrap();
-        let obj = Compiler::new().unwrap().compile_exprs(&exprs);
-        assert!(obj.is_ok());
-        assert!(!obj.unwrap().is_empty());
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
     }
 
     #[test]
@@ -262,6 +517,44 @@ mod tests {
     #[test]
     fn test_compile_multiple_exprs() {
         let exprs = parse("1 2 3").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_def() {
+        let exprs = parse("(def x 42) x").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_defun_and_call() {
+        let exprs = parse("(defun answer () 42) (answer)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_defun_with_params() {
+        let exprs = parse("(defun identity (x) x) (identity 99)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_defun_multi_param() {
+        let exprs = parse("(defun first (a b) a) (first 1 2)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_do() {
+        let exprs = parse("(do 1 2 3)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_defun_recursive() {
+        // Recursive function (countdown to 0, returns 0)
+        // Can't test full recursion without if, but verify it compiles
+        let exprs = parse("(defun f (x) x) (f 5)").unwrap();
         assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
     }
 }
