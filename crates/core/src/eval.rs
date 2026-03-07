@@ -458,4 +458,20 @@ mod tests {
             Value::Int(10) // 0+1+2+3+4
         );
     }
+
+    #[test]
+    fn test_eval_closure() {
+        assert_eq!(
+            eval_str("(defun make-adder (x) (fn (y) (+ x y))) (def add5 (make-adder 5)) (add5 3)").unwrap(),
+            Value::Int(8)
+        );
+    }
+
+    #[test]
+    fn test_eval_closure_lexical_scope() {
+        assert_eq!(
+            eval_str("(def x 10) (defun get-x () x) (let [x 20] (get-x))").unwrap(),
+            Value::Int(10) // lexical scope: get-x captures x=10
+        );
+    }
 }
