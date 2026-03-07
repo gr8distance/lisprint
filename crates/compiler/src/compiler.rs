@@ -301,8 +301,14 @@ impl Compiler {
                     match sym.as_str() {
                         "def" => return Self::emit_def(&items[1..], builder, module, strings, functions, scope),
                         "do" => return Self::emit_do(&items[1..], builder, module, strings, functions, scope),
+                        "if" => return Self::emit_if(&items[1..], builder, module, strings, functions, scope),
+                        "let" => return Self::emit_let(&items[1..], builder, module, strings, functions, scope),
+                        "+" | "-" | "*" | "/" | "%" =>
+                            return Self::emit_arith(sym.as_str(), &items[1..], builder, module, strings, functions, scope),
+                        "=" | "<" | ">" | "<=" | ">=" | "!=" =>
+                            return Self::emit_cmp(sym.as_str(), &items[1..], builder, module, strings, functions, scope),
+                        "not" => return Self::emit_not(&items[1..], builder, module, strings, functions, scope),
                         "defun" => {
-                            // defun is handled at top level, skip here
                             let tag = builder.ins().iconst(types::I64, TAG_NIL);
                             let payload = builder.ins().iconst(types::I64, 0);
                             return Ok((tag, payload));
@@ -363,6 +369,192 @@ impl Compiler {
         let (tag_var, payload_var) = scope.declare_var(name, builder);
         builder.def_var(tag_var, tag);
         builder.def_var(payload_var, payload);
+        Ok((tag, payload))
+    }
+
+    /// (if cond then else?)
+    fn emit_if(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err("if requires 2 or 3 arguments".to_string());
+        }
+
+        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
+
+        // Truthy: not nil (tag!=0) and not false (tag==1 && payload==0)
+        // Falsy: nil (tag==0) OR (tag==1 AND payload==0)
+        let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
+        let is_bool = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_BOOL);
+        let is_false_val = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0);
+        let is_false_bool = builder.ins().band(is_bool, is_false_val);
+        let is_falsy = builder.ins().bor(is_nil, is_false_bool);
+
+        let then_block = builder.create_block();
+        let else_block = builder.create_block();
+        let merge_block = builder.create_block();
+
+        builder.append_block_param(merge_block, types::I64); // result tag
+        builder.append_block_param(merge_block, types::I64); // result payload
+
+        builder.ins().brif(is_falsy, else_block, &[], then_block, &[]);
+
+        // Then branch
+        builder.switch_to_block(then_block);
+        builder.seal_block(then_block);
+        let (then_tag, then_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+        builder.ins().jump(merge_block, &[then_tag, then_payload]);
+
+        // Else branch
+        builder.switch_to_block(else_block);
+        builder.seal_block(else_block);
+        let (else_tag, else_payload) = if args.len() == 3 {
+            Self::emit_expr(&args[2], builder, module, strings, functions, scope)?
+        } else {
+            let t = builder.ins().iconst(types::I64, TAG_NIL);
+            let p = builder.ins().iconst(types::I64, 0);
+            (t, p)
+        };
+        builder.ins().jump(merge_block, &[else_tag, else_payload]);
+
+        // Merge
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        let result_tag = builder.block_params(merge_block)[0];
+        let result_payload = builder.block_params(merge_block)[1];
+        Ok((result_tag, result_payload))
+    }
+
+    /// (let (bindings...) body...)
+    fn emit_let(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.is_empty() {
+            return Err("let requires bindings and body".to_string());
+        }
+
+        let bindings = match &args[0] {
+            Value::List(items) | Value::Vec(items) => items.to_vec(),
+            _ => return Err("let bindings must be a list or vector".to_string()),
+        };
+
+        if bindings.len() % 2 != 0 {
+            return Err("let bindings must have even number of elements".to_string());
+        }
+
+        for chunk in bindings.chunks(2) {
+            let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
+            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope)?;
+            let (tag_var, payload_var) = scope.declare_var(name, builder);
+            builder.def_var(tag_var, tag);
+            builder.def_var(payload_var, payload);
+        }
+
+        let body = &args[1..];
+        let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let mut last_payload = builder.ins().iconst(types::I64, 0);
+        for expr in body {
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope)?;
+            last_tag = tag;
+            last_payload = payload;
+        }
+        Ok((last_tag, last_payload))
+    }
+
+    /// Arithmetic: +, -, *, /, %
+    fn emit_arith(
+        op: &str,
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() != 2 {
+            return Err(format!("{} requires 2 arguments", op));
+        }
+        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
+        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+
+        let result = match op {
+            "+" => builder.ins().iadd(lhs, rhs),
+            "-" => builder.ins().isub(lhs, rhs),
+            "*" => builder.ins().imul(lhs, rhs),
+            "/" => builder.ins().sdiv(lhs, rhs),
+            "%" => builder.ins().srem(lhs, rhs),
+            _ => unreachable!(),
+        };
+
+        let tag = builder.ins().iconst(types::I64, TAG_INT);
+        Ok((tag, result))
+    }
+
+    /// Comparison: =, <, >, <=, >=, !=
+    fn emit_cmp(
+        op: &str,
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() != 2 {
+            return Err(format!("{} requires 2 arguments", op));
+        }
+        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
+        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope)?;
+
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let cc = match op {
+            "=" => IntCC::Equal,
+            "!=" => IntCC::NotEqual,
+            "<" => IntCC::SignedLessThan,
+            ">" => IntCC::SignedGreaterThan,
+            "<=" => IntCC::SignedLessThanOrEqual,
+            ">=" => IntCC::SignedGreaterThanOrEqual,
+            _ => unreachable!(),
+        };
+
+        let cmp_result = builder.ins().icmp(cc, lhs, rhs);
+        let tag = builder.ins().iconst(types::I64, TAG_BOOL);
+        let payload = builder.ins().uextend(types::I64, cmp_result);
+        Ok((tag, payload))
+    }
+
+    /// (not expr)
+    fn emit_not(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, (FuncId, usize)>,
+        scope: &mut FnScope,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() != 1 {
+            return Err("not requires 1 argument".to_string());
+        }
+        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope)?;
+
+        // Falsy = nil or false
+        let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
+        let is_bool = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_BOOL);
+        let is_false_val = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0);
+        let is_false_bool = builder.ins().band(is_bool, is_false_val);
+        let is_falsy = builder.ins().bor(is_nil, is_false_bool);
+        let tag = builder.ins().iconst(types::I64, TAG_BOOL);
+        let payload = builder.ins().uextend(types::I64, is_falsy);
         Ok((tag, payload))
     }
 
@@ -552,9 +744,77 @@ mod tests {
 
     #[test]
     fn test_compile_defun_recursive() {
-        // Recursive function (countdown to 0, returns 0)
-        // Can't test full recursion without if, but verify it compiles
         let exprs = parse("(defun f (x) x) (f 5)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_if() {
+        let exprs = parse("(if true 1 2)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_if_no_else() {
+        let exprs = parse("(if true 42)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_if_nil() {
+        let exprs = parse("(if nil 1 2)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_let() {
+        let exprs = parse("(let (x 10 y 20) (+ x y))").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_arithmetic() {
+        let exprs = parse("(+ 1 2)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        let exprs = parse("(- 10 3)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        let exprs = parse("(* 4 5)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        let exprs = parse("(/ 10 2)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_comparison() {
+        let exprs = parse("(= 1 1)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        let exprs = parse("(< 1 2)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        let exprs = parse("(> 3 1)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_not() {
+        let exprs = parse("(not true)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_factorial() {
+        // Recursive factorial
+        let exprs = parse("(defun fact (n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 5)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_fibonacci() {
+        let exprs = parse("(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 10)").unwrap();
         assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
     }
 }
