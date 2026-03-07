@@ -1917,6 +1917,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_require_stdlib_http() {
+        // Just verify the module loads and functions are defined
+        let result = eval_str("(require 'http) (fn? http/get)").unwrap();
+        assert_eq!(result, Value::Bool(true));
+        let result = eval_str("(require 'http) (fn? http/post)").unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
     fn eval_with_module_path(dir: &str, input: &str) -> LispResult {
         let exprs = parse(input).unwrap();
         let mut env = Env::new();
