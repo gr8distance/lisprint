@@ -10,10 +10,11 @@ lisprint/
 │   ├── core/          # 言語コア (lisprint-core)
 │   │   ├── value.rs   # Arc<Value> 型定義 (TypeInstance含む)
 │   │   ├── parser.rs  # S式パーサ
-│   │   ├── eval.rs    # tree-walk evaluator (82テスト)
+│   │   ├── eval.rs    # tree-walk evaluator (94テスト)
 │   │   ├── env.rs     # 環境 (スコープチェーン)
 │   │   ├── builtins.rs # 組み込み関数
-│   │   └── prelude.rs # preludeローダー
+│   │   ├── prelude.rs # preludeローダー
+│   │   └── stdlib/    # Rustネイティブstdlibモジュール群
 │   └── cli/           # CLI (lisprint)
 │       └── main.rs    # REPL + ファイル実行 + test
 └── lib/
@@ -52,7 +53,7 @@ cargo run -- repl      # REPL起動 (明示)
 cargo run -- run FILE  # ファイル実行
 cargo run -- test      # *_test.lisp 自動検出・テスト実行
 cargo run -- test FILE # 指定ファイルのテスト実行
-cargo test             # Rustテスト実行 (82テスト)
+cargo test             # Rustテスト実行 (94テスト)
 ```
 
 ## 開発ルール
