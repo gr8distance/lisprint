@@ -44,17 +44,25 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "do" => return eval_do(&items[1..], env),
             "quote" => return eval_quote(&items[1..]),
             "quasiquote" => return eval_quasiquote(&items[1..], env),
+            "defmacro" => return eval_defmacro(&items[1..], env),
+            "macroexpand" => return eval_macroexpand(&items[1..], env),
             "loop" => return eval_loop(&items[1..], env),
             _ => {}
         }
     }
 
+    // マクロ展開チェック
+    let head_val = eval(head, env)?;
+    if let Value::Macro(mac) = &head_val {
+        let expanded = expand_macro(mac, &items[1..], env)?;
+        return eval(&expanded, env);
+    }
+
     // 関数呼び出し
-    let func = eval(head, env)?;
     let args: Result<Vec<Value>, _> = items[1..].iter().map(|v| eval(v, env)).collect();
     let args = args?;
 
-    apply(&func, &args)
+    apply(&head_val, &args)
 }
 
 /// 関数を適用する (TCO対応)
@@ -212,6 +220,72 @@ fn eval_quote(args: &[Value]) -> LispResult {
         return Err(LispError::new("quote requires exactly 1 argument"));
     }
     Ok(args[0].clone())
+}
+
+/// (defmacro name (params...) body...)
+fn eval_defmacro(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() < 3 {
+        return Err(LispError::new("defmacro requires name, params, and body"));
+    }
+
+    let name = args[0].as_symbol()?.to_string();
+    let params = parse_params(&args[1])?;
+    let body = args[2..].to_vec();
+
+    let mac = Value::Macro(Arc::new(LispFn {
+        name: Some(name.clone()),
+        params,
+        body,
+        env: env.clone(),
+    }));
+
+    env.define(name, mac.clone());
+    Ok(mac)
+}
+
+/// マクロを展開する (引数は評価せずに渡す)
+fn expand_macro(mac: &LispFn, args: &[Value], _env: &mut Env) -> LispResult {
+    if args.len() != mac.params.len() {
+        return Err(LispError::new(format!(
+            "macro {}: expected {} args, got {}",
+            mac.name.as_deref().unwrap_or("anonymous"),
+            mac.params.len(),
+            args.len()
+        )));
+    }
+
+    let mut macro_env = Env::with_parent(Arc::new(mac.env.clone()));
+    for (param, arg) in mac.params.iter().zip(args.iter()) {
+        macro_env.define(param.clone(), arg.clone());
+    }
+
+    // マクロのbodyを評価して展開結果を返す
+    let body = &mac.body;
+    if body.is_empty() {
+        return Ok(Value::Nil);
+    }
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &mut macro_env)?;
+    }
+    eval(&body[body.len() - 1], &mut macro_env)
+}
+
+/// (macroexpand expr) — マクロを1回展開する (デバッグ用)
+fn eval_macroexpand(args: &[Value], env: &mut Env) -> LispResult {
+    if args.len() != 1 {
+        return Err(LispError::new("macroexpand requires exactly 1 argument"));
+    }
+    let expr = eval(&args[0], env)?;
+    if let Value::List(items) = &expr {
+        if !items.is_empty() {
+            if let Ok(head_val) = eval(&items[0], env) {
+                if let Value::Macro(mac) = &head_val {
+                    return expand_macro(mac, &items[1..], env);
+                }
+            }
+        }
+    }
+    Ok(expr)
 }
 
 /// (quasiquote expr) — ` 記法
@@ -538,6 +612,27 @@ mod tests {
         assert_eq!(
             eval_str("(def xs '(2 3)) `(1 ~@xs 4)").unwrap(),
             Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])
+        );
+    }
+
+    #[test]
+    fn test_eval_defmacro() {
+        // unless マクロ: (unless cond body) → (if (not cond) body)
+        assert_eq!(
+            eval_str("(defmacro unless (cond body) `(if (not ~cond) ~body)) (unless false 42)").unwrap(),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn test_eval_defmacro_when() {
+        assert_eq!(
+            eval_str("(defmacro when (cond body) `(if ~cond ~body nil)) (when true 99)").unwrap(),
+            Value::Int(99)
+        );
+        assert_eq!(
+            eval_str("(defmacro when (cond body) `(if ~cond ~body nil)) (when false 99)").unwrap(),
+            Value::Nil
         );
     }
 

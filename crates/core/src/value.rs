@@ -17,6 +17,7 @@ pub enum Value {
     Map(Arc<HashMap<String, Value>>),
     Fn(Arc<LispFn>),
     NativeFn(Arc<NativeFnData>),
+    Macro(Arc<LispFn>),
 }
 
 /// Lispで定義された関数
@@ -159,6 +160,7 @@ impl Value {
             Value::Map(_) => "map",
             Value::Fn(_) => "fn",
             Value::NativeFn(_) => "fn",
+            Value::Macro(_) => "macro",
         }
     }
 }
@@ -202,6 +204,9 @@ impl fmt::Display for Value {
             }
             Value::NativeFn(func) => {
                 write!(f, "<native-fn {}>", func.name)
+            }
+            Value::Macro(m) => {
+                write!(f, "<macro {}>", m.name.as_deref().unwrap_or("anonymous"))
             }
         }
     }
