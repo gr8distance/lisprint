@@ -6,16 +6,54 @@ use lisprint_core::eval;
 use lisprint_core::parser;
 use lisprint_core::prelude;
 
+mod project;
+
 fn main() {
     let args: Vec<String> = std_env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
         Some("repl") | None => run_repl(),
+        Some("new") => {
+            if let Some(name) = args.get(2) {
+                if let Err(e) = project::new_project(name) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("Usage: lisprint new <project-name>");
+                std::process::exit(1);
+            }
+        }
+        Some("init") => {
+            if let Err(e) = project::init_project() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some("add") => {
+            if let Some(pkg) = args.get(2) {
+                if let Err(e) = project::add_dependency(pkg) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("Usage: lisprint add <package>");
+                std::process::exit(1);
+            }
+        }
         Some("run") => {
             if let Some(path) = args.get(2) {
                 run_file(path);
+            } else if let Some(proj) = project::Project::find() {
+                let entry = proj.entry_file();
+                if !entry.exists() {
+                    eprintln!("Entry file not found: {}", entry.display());
+                    std::process::exit(1);
+                }
+                run_file_with_deps(&entry.to_string_lossy(), &proj);
             } else {
                 eprintln!("Usage: lisprint run <file.lisp>");
+                eprintln!("  Or run from a project directory with lisp.toml");
                 std::process::exit(1);
             }
         }
@@ -24,20 +62,28 @@ fn main() {
             run_tests(&files);
         }
         Some("build") => {
-            if let Some(path) = args.get(2) {
-                let container = args.iter().any(|a| a == "--container");
+            let container = args.iter().any(|a| a == "--container");
+            if let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) {
                 let output = args[3..].iter()
                     .find(|a| !a.starts_with("--"))
                     .map(|s| s.as_str());
                 build_binary(path, output, container);
+            } else if let Some(proj) = project::Project::find() {
+                let entry = proj.entry_file();
+                if !entry.exists() {
+                    eprintln!("Entry file not found: {}", entry.display());
+                    std::process::exit(1);
+                }
+                build_binary(&entry.to_string_lossy(), Some(proj.name.as_str()), container);
             } else {
-                eprintln!("Usage: lisprint build <file.lisp> [output] [--container]");
+                eprintln!("Usage: lisprint build [file.lisp] [output] [--container]");
+                eprintln!("  Or run from a project directory with lisp.toml");
                 std::process::exit(1);
             }
         }
         Some(cmd) => {
             eprintln!("Unknown command: {}", cmd);
-            eprintln!("Usage: lisprint [repl|run <file>|build <file> [output]|test <files...>]");
+            eprintln!("Usage: lisprint [new|init|add|repl|run|build|test]");
             std::process::exit(1);
         }
     }
@@ -373,6 +419,48 @@ ENTRYPOINT ["/app"]
         println!();
         println!("Note: For scratch containers, rebuild with a static-linked binary:");
         println!("  Cross-compile with musl: CC=musl-gcc lisprint build {} {} --container", path, output_name);
+    }
+}
+
+fn run_file_with_deps(path: &str, proj: &project::Project) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut env = Env::new();
+    builtins::register(&mut env);
+    prelude::load(&mut env).expect("failed to load prelude");
+
+    // Auto-require dependencies from lisp.toml
+    for dep in proj.dependencies.keys() {
+        let require_expr = format!("(require \"{}\")", dep);
+        if let Ok(exprs) = parser::parse(&require_expr) {
+            for expr in &exprs {
+                if let Err(e) = eval::eval(expr, &mut env) {
+                    eprintln!("Error loading dependency '{}': {}", dep, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    match parser::parse(&source) {
+        Ok(exprs) => {
+            for expr in &exprs {
+                if let Err(e) = eval::eval(expr, &mut env) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

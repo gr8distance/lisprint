@@ -11,3 +11,4 @@ path = "src/main.rs"
 lisprint-core = { path = "../core" }
 lisprint-compiler = { path = "../compiler" }
 rustyline = "15"
+toml = "0.8"
