@@ -351,6 +351,114 @@ impl Compiler {
         format!("__anon_{:016x}", hasher.finish())
     }
 
+    /// TCO: If a function body contains tail-recursive self-calls, wrap it in loop/recur.
+    /// Returns the (possibly transformed) body.
+    fn apply_tco(fn_name: &str, params: &[Value], body: &[Value]) -> Vec<Value> {
+        // Only transform if the body has tail-recursive self-calls
+        if body.is_empty() || !Self::has_tail_self_call(fn_name, body.last().unwrap()) {
+            return body.to_vec();
+        }
+
+        // Build loop bindings: (param1 param1 param2 param2 ...)
+        let mut bindings = Vec::new();
+        for p in params {
+            bindings.push(p.clone());  // binding name
+            bindings.push(p.clone());  // initial value = parameter itself
+        }
+
+        // Transform body: replace tail self-calls with recur
+        let mut transformed_body = body.to_vec();
+        let last_idx = transformed_body.len() - 1;
+        transformed_body[last_idx] = Self::replace_tail_calls(fn_name, &transformed_body[last_idx]);
+
+        // Wrap in (loop (bindings...) body...)
+        let mut loop_form = vec![
+            Value::Symbol(std::sync::Arc::new("loop".to_string())),
+            Value::Vec(std::sync::Arc::new(bindings)),
+        ];
+        loop_form.extend(transformed_body);
+
+        vec![Value::List(std::sync::Arc::new(loop_form))]
+    }
+
+    /// Check if an expression contains a tail-recursive self-call
+    fn has_tail_self_call(fn_name: &str, expr: &Value) -> bool {
+        if let Value::List(items) = expr {
+            if let Some(Value::Symbol(sym)) = items.first() {
+                match sym.as_str() {
+                    s if s == fn_name => return true,
+                    "if" => {
+                        // Check then and else branches
+                        if items.len() >= 3 && Self::has_tail_self_call(fn_name, &items[2]) {
+                            return true;
+                        }
+                        if items.len() >= 4 && Self::has_tail_self_call(fn_name, &items[3]) {
+                            return true;
+                        }
+                    }
+                    "do" => {
+                        if let Some(last) = items.last() {
+                            return Self::has_tail_self_call(fn_name, last);
+                        }
+                    }
+                    "let" => {
+                        if let Some(last) = items.last() {
+                            if items.len() > 2 {
+                                return Self::has_tail_self_call(fn_name, last);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// Replace tail-position self-calls with recur
+    fn replace_tail_calls(fn_name: &str, expr: &Value) -> Value {
+        if let Value::List(items) = expr {
+            if let Some(Value::Symbol(sym)) = items.first() {
+                match sym.as_str() {
+                    s if s == fn_name => {
+                        // Replace (fn_name args...) with (recur args...)
+                        let mut new_items = vec![Value::Symbol(std::sync::Arc::new("recur".to_string()))];
+                        new_items.extend(items[1..].iter().cloned());
+                        return Value::List(std::sync::Arc::new(new_items));
+                    }
+                    "if" => {
+                        // Transform both branches
+                        let mut new_items = items.to_vec();
+                        if new_items.len() >= 3 {
+                            new_items[2] = Self::replace_tail_calls(fn_name, &new_items[2]);
+                        }
+                        if new_items.len() >= 4 {
+                            new_items[3] = Self::replace_tail_calls(fn_name, &new_items[3]);
+                        }
+                        return Value::List(std::sync::Arc::new(new_items));
+                    }
+                    "do" => {
+                        let mut new_items = items.to_vec();
+                        if let Some(last) = new_items.last_mut() {
+                            *last = Self::replace_tail_calls(fn_name, last);
+                        }
+                        return Value::List(std::sync::Arc::new(new_items));
+                    }
+                    "let" => {
+                        if items.len() > 2 {
+                            let mut new_items = items.to_vec();
+                            let last_idx = new_items.len() - 1;
+                            new_items[last_idx] = Self::replace_tail_calls(fn_name, &new_items[last_idx]);
+                            return Value::List(std::sync::Arc::new(new_items));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        expr.clone()
+    }
+
     /// Quick type check for an expression using scope type annotations.
     /// Used by emit_arith to skip tag dispatch when types are known.
     fn expr_type(expr: &Value, scope: &FnScope) -> LType {
@@ -1773,7 +1881,9 @@ impl Compiler {
         }).collect();
 
         for (name, params, body) in &defuns {
-            self.compile_defun(name, params, body)?;
+            // TCO: transform tail-recursive self-calls into loop/recur
+            let body = Self::apply_tco(name, params, body);
+            self.compile_defun(name, params, &body)?;
         }
 
         // Pass 3.5: compile pending anonymous functions
