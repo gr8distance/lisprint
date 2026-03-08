@@ -133,7 +133,16 @@ impl TypeInfer {
                                         }
                                     }
 
-                                    let ret_type = self.infer_body(body, &mut scope);
+                                    let inferred_ret = self.infer_body(body, &mut scope);
+                                    // Preserve annotated return type if body inference is less specific
+                                    let (_, existing_ret) = self.fn_types.get(fn_name)
+                                        .cloned()
+                                        .unwrap_or((vec![], LType::Any));
+                                    let ret_type = if existing_ret != LType::Any && inferred_ret == LType::Any {
+                                        existing_ret
+                                    } else {
+                                        inferred_ret
+                                    };
                                     self.fn_types.insert(fn_name.to_string(), (param_types, ret_type));
                                 }
                             }
@@ -312,10 +321,12 @@ impl TypeInfer {
                     "defun" if items.len() >= 4 => {
                         // Set up scope with function parameters
                         let mut fn_scope = TypeScope::new();
-                        if let (Value::Symbol(name), Value::List(params)) = (&items[1], &items[2]) {
-                            if let Some((param_types, _)) = self.fn_types.get(name.as_str()).cloned() {
+                        if let (Value::Symbol(raw_name), Value::List(params)) = (&items[1], &items[2]) {
+                            let (fn_name, _) = Value::parse_type_ann(raw_name);
+                            if let Some((param_types, _)) = self.fn_types.get(fn_name).cloned() {
                                 for (i, p) in params.iter().enumerate() {
-                                    if let Ok(pname) = p.as_symbol() {
+                                    if let Ok(psym) = p.as_symbol() {
+                                        let (pname, _) = Value::parse_type_ann(psym);
                                         fn_scope.set(pname, param_types.get(i).cloned().unwrap_or(LType::Any));
                                     }
                                 }
@@ -488,5 +499,37 @@ mod tests {
         ti.infer_program(&exprs);
         let (params, _) = ti.get_fn_type("greet").unwrap();
         assert_eq!(params, &[LType::Str]);
+    }
+
+    #[test]
+    fn test_type_annotation_params() {
+        // Type annotations should set types without call-site inference
+        let exprs = parse("(defun square:i64 (x:i64) (* x x))").unwrap();
+        let mut ti = TypeInfer::new();
+        ti.infer_program(&exprs);
+        let (params, ret) = ti.get_fn_type("square").unwrap();
+        assert_eq!(params, &[LType::Int]);
+        assert_eq!(*ret, LType::Int);
+    }
+
+    #[test]
+    fn test_type_annotation_float() {
+        let exprs = parse("(defun dist:f64 (x:f64 y:f64) (+ (* x x) (* y y)))").unwrap();
+        let mut ti = TypeInfer::new();
+        ti.infer_program(&exprs);
+        let (params, ret) = ti.get_fn_type("dist").unwrap();
+        assert_eq!(params, &[LType::Float, LType::Float]);
+        assert_eq!(*ret, LType::Float);
+    }
+
+    #[test]
+    fn test_type_annotation_no_callsite() {
+        // Even without any call site, annotations should provide types
+        let exprs = parse("(defun add:i64 (a:i64 b:i64) (+ a b))").unwrap();
+        let mut ti = TypeInfer::new();
+        ti.infer_program(&exprs);
+        let (params, ret) = ti.get_fn_type("add").unwrap();
+        assert_eq!(params, &[LType::Int, LType::Int]);
+        assert_eq!(*ret, LType::Int);
     }
 }
