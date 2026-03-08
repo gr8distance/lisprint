@@ -67,6 +67,20 @@ impl TypeInfer {
         }
     }
 
+    /// Convert a type annotation string to LType
+    fn type_name_to_ltype(name: &str) -> Option<LType> {
+        match name {
+            "i64" | "int" => Some(LType::Int),
+            "f64" | "float" => Some(LType::Float),
+            "bool" => Some(LType::Bool),
+            "string" | "str" => Some(LType::Str),
+            "nil" => Some(LType::Nil),
+            "list" => Some(LType::List),
+            "fn" => Some(LType::Fn),
+            _ => None, // Unknown type (future: UserType)
+        }
+    }
+
     /// Infer types for all top-level expressions.
     /// Returns a map from function name → (param_types, return_type).
     pub fn infer_program(&mut self, exprs: &[Value]) -> &HashMap<String, (Vec<LType>, LType)> {
@@ -74,11 +88,20 @@ impl TypeInfer {
         for expr in exprs {
             if let Value::List(items) = expr {
                 if items.len() >= 4 {
-                    if let (Value::Symbol(sym), Value::Symbol(name)) = (&items[0], &items[1]) {
+                    if let (Value::Symbol(sym), Value::Symbol(raw_name)) = (&items[0], &items[1]) {
                         if sym.as_str() == "defun" {
                             if let Value::List(params) = &items[2] {
-                                let param_types = vec![LType::Any; params.len()];
-                                self.fn_types.insert(name.to_string(), (param_types, LType::Any));
+                                let (fn_name, _ret_ann) = Value::parse_type_ann(raw_name);
+                                let param_types: Vec<LType> = params.iter().map(|p| {
+                                    if let Ok(s) = p.as_symbol() {
+                                        let (_, type_ann) = Value::parse_type_ann(s);
+                                        type_ann.and_then(Self::type_name_to_ltype).unwrap_or(LType::Any)
+                                    } else {
+                                        LType::Any
+                                    }
+                                }).collect();
+                                let ret_type = _ret_ann.and_then(Self::type_name_to_ltype).unwrap_or(LType::Any);
+                                self.fn_types.insert(fn_name.to_string(), (param_types, ret_type));
                             }
                         }
                     }
@@ -93,23 +116,25 @@ impl TypeInfer {
             for expr in exprs {
                 if let Value::List(items) = expr {
                     if items.len() >= 4 {
-                        if let (Value::Symbol(sym), Value::Symbol(name)) = (&items[0], &items[1]) {
+                        if let (Value::Symbol(sym), Value::Symbol(raw_name)) = (&items[0], &items[1]) {
                             if sym.as_str() == "defun" {
                                 if let Value::List(params) = &items[2] {
+                                    let (fn_name, _) = Value::parse_type_ann(raw_name);
                                     let body = &items[3..];
-                                    let (param_types, _) = fn_types_snapshot.get(name.as_str())
+                                    let (param_types, _) = fn_types_snapshot.get(fn_name)
                                         .cloned()
                                         .unwrap_or((vec![LType::Any; params.len()], LType::Any));
 
                                     let mut scope = TypeScope::new();
                                     for (i, param) in params.iter().enumerate() {
-                                        if let Ok(pname) = param.as_symbol() {
+                                        if let Ok(psym) = param.as_symbol() {
+                                            let (pname, _) = Value::parse_type_ann(psym);
                                             scope.set(pname, param_types.get(i).cloned().unwrap_or(LType::Any));
                                         }
                                     }
 
                                     let ret_type = self.infer_body(body, &mut scope);
-                                    self.fn_types.insert(name.to_string(), (param_types, ret_type));
+                                    self.fn_types.insert(fn_name.to_string(), (param_types, ret_type));
                                 }
                             }
                         }

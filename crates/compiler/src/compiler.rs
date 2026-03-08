@@ -744,20 +744,21 @@ impl Compiler {
                 if items.len() >= 4 {
                     if let Value::Symbol(sym) = &items[0] {
                         if sym.as_str() == "defun" {
-                            if let Value::Symbol(name) = &items[1] {
+                            if let Value::Symbol(raw_name) = &items[1] {
                                 if let Value::List(params) = &items[2] {
+                                    let (name, _ret_ann) = Value::parse_type_ann(raw_name);
                                     let param_count = params.len();
                                     let func_name = format!("_lsp_fn_{}", name);
 
                                     // Check if this function can use unboxed calling convention
-                                    let use_unboxed = if let Some((ptypes, rtype)) = self.fn_types.get(name.as_str()) {
+                                    let use_unboxed = if let Some((ptypes, rtype)) = self.fn_types.get(name) {
                                         is_unboxable(ptypes, rtype)
                                     } else {
                                         false
                                     };
 
                                     let (sig, ret_tag) = if use_unboxed {
-                                        let (ptypes, rtype) = self.fn_types.get(name.as_str()).unwrap().clone();
+                                        let (ptypes, rtype) = self.fn_types.get(name).unwrap().clone();
                                         let tag = ltype_to_tag(&rtype).unwrap();
                                         self.unboxed_fns.insert(name.to_string(), (ptypes, rtype));
                                         (self.make_unboxed_fn_sig(param_count), Some(tag))
@@ -782,7 +783,10 @@ impl Compiler {
     /// Compile a defun into a Cranelift function
     fn compile_defun(&mut self, name: &str, params: &[Value], body: &[Value]) -> Result<(), String> {
         let param_names: Vec<String> = params.iter()
-            .map(|p| p.as_symbol().map(|s| s.to_string()))
+            .map(|p| p.as_symbol().map(|s| {
+                let (name, _type_ann) = Value::parse_type_ann(s);
+                name.to_string()
+            }))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
@@ -2120,7 +2124,8 @@ impl Compiler {
                         if sym.as_str() == "defun" {
                             if let Value::List(params) = &items[2] {
                                 let body = items[3..].to_vec();
-                                return Some((name.to_string(), params.to_vec(), body));
+                                let (fn_name, _ret_ann) = Value::parse_type_ann(name);
+                                return Some((fn_name.to_string(), params.to_vec(), body));
                             }
                         }
                     }

@@ -142,7 +142,8 @@ fn eval_def(args: &[Value], env: &mut Env) -> LispResult {
     if args.len() != 2 {
         return Err(LispError::new("def requires exactly 2 arguments"));
     }
-    let name = args[0].as_symbol()?;
+    let sym = args[0].as_symbol()?;
+    let (name, _type_ann) = Value::parse_type_ann(sym);
     let val = eval(&args[1], env)?;
     env.define(name, val.clone());
     Ok(val)
@@ -155,7 +156,9 @@ fn eval_defun(args: &[Value], env: &mut Env) -> LispResult {
         return Err(LispError::new("defun requires name and body"));
     }
 
-    let name = args[0].as_symbol()?.to_string();
+    let sym = args[0].as_symbol()?;
+    let (name_str, _ret_type_ann) = Value::parse_type_ann(sym);
+    let name = name_str.to_string();
 
     // 複数アリティ: args[1] が (params body...) のリスト形式かチェック
     let is_multi = if let Value::List(items) = &args[1] {
@@ -437,7 +440,9 @@ fn eval_loop(args: &[Value], env: &mut Env) -> LispResult {
     let mut values = Vec::new();
 
     for chunk in bindings.chunks(2) {
-        names.push(chunk[0].as_symbol()?.to_string());
+        let sym = chunk[0].as_symbol()?;
+        let (name, _type_ann) = Value::parse_type_ann(sym);
+        names.push(name.to_string());
         values.push(chunk[1].clone());
     }
 
@@ -1182,9 +1187,10 @@ fn get_module_exports(env: &Env) -> Vec<String> {
 /// 分配束縛: パターンに基づいて値を分解し環境に束縛
 fn destructure_bind(pattern: &Value, val: &Value, env: &mut Env) -> Result<(), LispError> {
     match pattern {
-        // 通常のシンボル束縛
+        // 通常のシンボル束縛 (型注釈を剥がす: x:i64 → x)
         Value::Symbol(s) => {
-            env.define(s.to_string(), val.clone());
+            let (name, _type_ann) = Value::parse_type_ann(s);
+            env.define(name, val.clone());
             Ok(())
         }
 
@@ -1238,7 +1244,10 @@ fn parse_params(value: &Value) -> Result<Vec<String>, LispError> {
         .iter()
         .map(|v| {
             v.as_symbol()
-                .map(|s| s.to_string())
+                .map(|s| {
+                    let (name, _type_ann) = Value::parse_type_ann(s);
+                    name.to_string()
+                })
                 .map_err(|_| LispError::new("function parameters must be symbols"))
         })
         .collect()

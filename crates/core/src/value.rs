@@ -98,6 +98,18 @@ impl Value {
         Value::Keyword(Arc::new(s.into()))
     }
 
+    /// Split a symbol string into (name, optional type annotation).
+    /// "x:i64" → ("x", Some("i64")), "x" → ("x", None)
+    /// Keywords (starting with ':') are never type-annotated.
+    pub fn parse_type_ann(sym: &str) -> (&str, Option<&str>) {
+        if let Some(pos) = sym.find(':') {
+            if pos > 0 && pos < sym.len() - 1 {
+                return (&sym[..pos], Some(&sym[pos + 1..]));
+            }
+        }
+        (sym, None)
+    }
+
     pub fn list(v: Vec<Value>) -> Self {
         Value::List(Arc::new(v))
     }
