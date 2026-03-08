@@ -888,15 +888,21 @@ impl Compiler {
             return Err("if requires 2 or 3 arguments".to_string());
         }
 
+        // Fast path: if condition is known-Bool (e.g., comparison result), skip tag checks
+        let cond_type = Self::expr_type(&args[0], scope);
         let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
 
-        // Truthy: not nil (tag!=0) and not false (tag==1 && payload==0)
-        // Falsy: nil (tag==0) OR (tag==1 AND payload==0)
-        let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
-        let is_bool = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_BOOL);
-        let is_false_val = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0);
-        let is_false_bool = builder.ins().band(is_bool, is_false_val);
-        let is_falsy = builder.ins().bor(is_nil, is_false_bool);
+        let is_falsy = if cond_type == LType::Bool {
+            // Known Bool: falsy = payload == 0
+            builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0)
+        } else {
+            // General case: falsy = nil OR (bool AND payload==0)
+            let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
+            let is_bool = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_BOOL);
+            let is_false_val = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0);
+            let is_false_bool = builder.ins().band(is_bool, is_false_val);
+            builder.ins().bor(is_nil, is_false_bool)
+        };
 
         let then_block = builder.create_block();
         let else_block = builder.create_block();
@@ -1595,13 +1601,18 @@ impl Compiler {
             return Err("if requires 2 or 3 arguments".to_string());
         }
 
+        let cond_type = Self::expr_type(&args[0], scope);
         let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
 
-        let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
-        let is_bool = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_BOOL);
-        let is_false_val = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0);
-        let is_false_bool = builder.ins().band(is_bool, is_false_val);
-        let is_falsy = builder.ins().bor(is_nil, is_false_bool);
+        let is_falsy = if cond_type == LType::Bool {
+            builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0)
+        } else {
+            let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
+            let is_bool = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_BOOL);
+            let is_false_val = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_payload, 0);
+            let is_false_bool = builder.ins().band(is_bool, is_false_val);
+            builder.ins().bor(is_nil, is_false_bool)
+        };
 
         let then_block = builder.create_block();
         let else_block = builder.create_block();
