@@ -1342,15 +1342,41 @@ impl Compiler {
         let rhs_type = Self::expr_type(&args[1], scope, functions);
 
         if lhs_type.is_known_int() && rhs_type.is_known_int() {
+            // Strength reduction: check for power-of-2 constant on RHS
+            let rhs_const = match &args[1] {
+                Value::Int(n) => Some(*n),
+                _ => None,
+            };
+
             let (_, lhs_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
-            let (_, rhs_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
-            let result = match op {
-                "+" => builder.ins().iadd(lhs_payload, rhs_payload),
-                "-" => builder.ins().isub(lhs_payload, rhs_payload),
-                "*" => builder.ins().imul(lhs_payload, rhs_payload),
-                "/" => builder.ins().sdiv(lhs_payload, rhs_payload),
-                "%" => builder.ins().srem(lhs_payload, rhs_payload),
-                _ => unreachable!(),
+
+            let result = match (op, rhs_const) {
+                // x / 2^k → x >> k (arithmetic shift for signed)
+                ("/", Some(n)) if n > 0 && (n as u64).is_power_of_two() => {
+                    let shift = n.trailing_zeros() as i64;
+                    builder.ins().sshr_imm(lhs_payload, shift)
+                }
+                // x % 2^k → x & (2^k - 1) when x >= 0 is guaranteed,
+                // but for signed modulo we need the general case unless it's % 2
+                ("%" , Some(2)) => {
+                    builder.ins().band_imm(lhs_payload, 1)
+                }
+                // x * 2^k → x << k
+                ("*", Some(n)) if n > 0 && (n as u64).is_power_of_two() => {
+                    let shift = n.trailing_zeros() as i64;
+                    builder.ins().ishl_imm(lhs_payload, shift)
+                }
+                _ => {
+                    let (_, rhs_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+                    match op {
+                        "+" => builder.ins().iadd(lhs_payload, rhs_payload),
+                        "-" => builder.ins().isub(lhs_payload, rhs_payload),
+                        "*" => builder.ins().imul(lhs_payload, rhs_payload),
+                        "/" => builder.ins().sdiv(lhs_payload, rhs_payload),
+                        "%" => builder.ins().srem(lhs_payload, rhs_payload),
+                        _ => unreachable!(),
+                    }
+                }
             };
             let tag = builder.ins().iconst(types::I64, TAG_INT);
             return Ok((tag, result));

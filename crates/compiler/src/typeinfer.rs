@@ -276,26 +276,82 @@ impl TypeInfer {
 
     /// Refine function parameter types from call sites
     fn refine_from_calls(&mut self, expr: &Value) {
+        let mut scope = TypeScope::new();
+        self.refine_from_calls_scoped(expr, &mut scope);
+    }
+
+    fn refine_from_calls_scoped(&mut self, expr: &Value, scope: &mut TypeScope) {
         if let Value::List(items) = expr {
             if let Some(Value::Symbol(sym)) = items.first() {
-                if let Some((param_types, ret_type)) = self.fn_types.get(sym.as_str()).cloned() {
-                    let args = &items[1..];
-                    if args.len() == param_types.len() {
-                        let mut scope = TypeScope::new();
-                        let mut new_params = param_types.clone();
-                        for (i, arg) in args.iter().enumerate() {
-                            let arg_type = self.infer_expr(arg, &mut scope);
-                            if arg_type != LType::Any {
-                                new_params[i] = Self::unify(&new_params[i], &arg_type);
+                match sym.as_str() {
+                    "defun" if items.len() >= 4 => {
+                        // Set up scope with function parameters
+                        let mut fn_scope = TypeScope::new();
+                        if let (Value::Symbol(name), Value::List(params)) = (&items[1], &items[2]) {
+                            if let Some((param_types, _)) = self.fn_types.get(name.as_str()).cloned() {
+                                for (i, p) in params.iter().enumerate() {
+                                    if let Ok(pname) = p.as_symbol() {
+                                        fn_scope.set(pname, param_types.get(i).cloned().unwrap_or(LType::Any));
+                                    }
+                                }
                             }
                         }
-                        self.fn_types.insert(sym.to_string(), (new_params, ret_type));
+                        for item in &items[3..] {
+                            self.refine_from_calls_scoped(item, &mut fn_scope);
+                        }
+                        return;
+                    }
+                    "def" if items.len() == 3 => {
+                        if let Ok(name) = items[1].as_symbol() {
+                            let ty = self.infer_expr(&items[2], scope);
+                            scope.set(name, ty);
+                        }
+                    }
+                    "let" if items.len() >= 2 => {
+                        if let Value::List(bindings) | Value::Vec(bindings) = &items[1] {
+                            for chunk in bindings.chunks(2) {
+                                if chunk.len() == 2 {
+                                    let ty = self.infer_expr(&chunk[1], scope);
+                                    if let Ok(name) = chunk[0].as_symbol() {
+                                        scope.set(name, ty);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "loop" if items.len() >= 3 => {
+                        if let Value::List(bindings) | Value::Vec(bindings) = &items[1] {
+                            for chunk in bindings.chunks(2) {
+                                if chunk.len() == 2 {
+                                    let ty = self.infer_expr(&chunk[1], scope);
+                                    if let Ok(name) = chunk[0].as_symbol() {
+                                        scope.set(name, ty);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Function call: refine parameter types
+                        if let Some((param_types, ret_type)) = self.fn_types.get(sym.as_str()).cloned() {
+                            let args = &items[1..];
+                            if args.len() == param_types.len() {
+                                let mut new_params = param_types.clone();
+                                for (i, arg) in args.iter().enumerate() {
+                                    let arg_type = self.infer_expr(arg, scope);
+                                    if arg_type != LType::Any {
+                                        new_params[i] = Self::unify(&new_params[i], &arg_type);
+                                    }
+                                }
+                                self.fn_types.insert(sym.to_string(), (new_params, ret_type));
+                            }
+                        }
                     }
                 }
             }
             // Recurse into sub-expressions
             for item in items.iter() {
-                self.refine_from_calls(item);
+                self.refine_from_calls_scoped(item, scope);
             }
         }
     }
