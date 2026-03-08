@@ -459,6 +459,68 @@ impl Compiler {
         expr.clone()
     }
 
+    /// Constant folding: try to evaluate an expression at compile time.
+    /// Returns Some(value) if the expression is a compile-time constant.
+    fn const_eval(expr: &Value) -> Option<Value> {
+        match expr {
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => {
+                Some(expr.clone())
+            }
+            Value::List(items) => {
+                if let Some(Value::Symbol(sym)) = items.first() {
+                    if items.len() == 3 {
+                        let lhs = Self::const_eval(&items[1])?;
+                        let rhs = Self::const_eval(&items[2])?;
+                        match sym.as_str() {
+                            "+" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) => return Some(Value::Int(a + b)),
+                                (Value::Float(a), Value::Float(b)) => return Some(Value::Float(a + b)),
+                                _ => {}
+                            },
+                            "-" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) => return Some(Value::Int(a - b)),
+                                (Value::Float(a), Value::Float(b)) => return Some(Value::Float(a - b)),
+                                _ => {}
+                            },
+                            "*" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) => return Some(Value::Int(a * b)),
+                                (Value::Float(a), Value::Float(b)) => return Some(Value::Float(a * b)),
+                                _ => {}
+                            },
+                            "/" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) if *b != 0 => return Some(Value::Int(a / b)),
+                                _ => {}
+                            },
+                            "=" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) => return Some(Value::Bool(a == b)),
+                                _ => {}
+                            },
+                            "<" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) => return Some(Value::Bool(a < b)),
+                                _ => {}
+                            },
+                            ">" => match (&lhs, &rhs) {
+                                (Value::Int(a), Value::Int(b)) => return Some(Value::Bool(a > b)),
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                    }
+                    if items.len() == 2 && sym.as_str() == "not" {
+                        let val = Self::const_eval(&items[1])?;
+                        match val {
+                            Value::Bool(b) => return Some(Value::Bool(!b)),
+                            Value::Nil => return Some(Value::Bool(true)),
+                            _ => return Some(Value::Bool(false)),
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Quick type check for an expression using scope type annotations.
     /// Used by emit_arith to skip tag dispatch when types are known.
     fn expr_type(expr: &Value, scope: &FnScope) -> LType {
@@ -696,6 +758,13 @@ impl Compiler {
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        // Constant folding: evaluate compile-time constant expressions
+        if let Value::List(_) = expr {
+            if let Some(folded) = Self::const_eval(expr) {
+                return Self::emit_expr(&folded, builder, module, strings, functions, scope, bridges);
+            }
+        }
+
         match expr {
             // Literals
             Value::Nil => {
@@ -994,6 +1063,24 @@ impl Compiler {
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() < 2 || args.len() > 3 {
             return Err("if requires 2 or 3 arguments".to_string());
+        }
+
+        // Dead code elimination: if condition is a compile-time constant, emit only the taken branch
+        if let Some(folded) = Self::const_eval(&args[0]) {
+            let is_truthy = match &folded {
+                Value::Nil => false,
+                Value::Bool(b) => *b,
+                _ => true, // non-nil, non-false values are truthy
+            };
+            return if is_truthy {
+                Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)
+            } else if args.len() == 3 {
+                Self::emit_expr(&args[2], builder, module, strings, functions, scope, bridges)
+            } else {
+                let t = builder.ins().iconst(types::I64, TAG_NIL);
+                let p = builder.ins().iconst(types::I64, 0);
+                Ok((t, p))
+            };
         }
 
         // Fast path: if condition is known-Bool (e.g., comparison result), skip tag checks
