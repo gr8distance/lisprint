@@ -351,6 +351,119 @@ impl Compiler {
         format!("__anon_{:016x}", hasher.finish())
     }
 
+    /// Binary recursion optimization: transforms (+ (f a) (f b)) into loop + single call.
+    /// Pattern: (defun f (n) (if cond base (+ (f e1) (f e2))))
+    /// Result:  (defun f (n) (loop (n n __acc 0) (if cond (+ base __acc) (recur e2 (+ __acc (f e1))))))
+    fn apply_binary_recursion_opt(fn_name: &str, params: &[Value], body: &[Value]) -> Vec<Value> {
+        use std::sync::Arc;
+        if body.len() != 1 {
+            return body.to_vec();
+        }
+
+        // Match: (if cond base (+ (self-call ...) (self-call ...)))
+        let expr = &body[0];
+        let items = match expr {
+            Value::List(items) if items.len() == 4 => items,
+            _ => return body.to_vec(),
+        };
+        let is_if = matches!(&items[0], Value::Symbol(s) if s.as_str() == "if");
+        if !is_if {
+            return body.to_vec();
+        }
+        let cond = &items[1];
+        let base = &items[2];
+        let recursive_branch = &items[3];
+
+        // Match: (+ (fn_name ...) (fn_name ...))
+        let plus_items = match recursive_branch {
+            Value::List(items) if items.len() == 3 => items,
+            _ => return body.to_vec(),
+        };
+        let is_plus = matches!(&plus_items[0], Value::Symbol(s) if s.as_str() == "+");
+        if !is_plus {
+            return body.to_vec();
+        }
+        let left_call = &plus_items[1];
+        let right_call = &plus_items[2];
+
+        let left_is_self = Self::is_self_call(fn_name, left_call);
+        let right_is_self = Self::is_self_call(fn_name, right_call);
+        if !left_is_self || !right_is_self {
+            return body.to_vec();
+        }
+
+        // Extract call arguments
+        let left_args: Vec<Value> = match left_call {
+            Value::List(items) => items[1..].to_vec(),
+            _ => return body.to_vec(),
+        };
+        let right_args: Vec<Value> = match right_call {
+            Value::List(items) => items[1..].to_vec(),
+            _ => return body.to_vec(),
+        };
+        if left_args.len() != params.len() || right_args.len() != params.len() {
+            return body.to_vec();
+        }
+
+        // Build: (loop (p1 p1 p2 p2 ... __acc 0) ...)
+        let acc_sym = Value::Symbol(Arc::new("__acc".to_string()));
+        let mut bindings = Vec::new();
+        for p in params {
+            bindings.push(p.clone());
+            bindings.push(p.clone());
+        }
+        bindings.push(acc_sym.clone());
+        bindings.push(Value::Int(0));
+
+        // Base case: (+ base __acc)
+        let new_base = Value::List(Arc::new(vec![
+            Value::Symbol(Arc::new("+".to_string())),
+            base.clone(),
+            acc_sym.clone(),
+        ]));
+
+        // Recursive call kept: (fn_name left_args...)
+        // Recur with right_args and (+ __acc (fn_name left_args...))
+        let kept_call = left_call.clone();
+        let new_acc = Value::List(Arc::new(vec![
+            Value::Symbol(Arc::new("+".to_string())),
+            acc_sym.clone(),
+            kept_call,
+        ]));
+
+        let mut recur_args = vec![Value::Symbol(Arc::new("recur".to_string()))];
+        recur_args.extend(right_args);
+        recur_args.push(new_acc);
+        let recur_form = Value::List(Arc::new(recur_args));
+
+        // (if cond new_base recur_form)
+        let new_if = Value::List(Arc::new(vec![
+            Value::Symbol(Arc::new("if".to_string())),
+            cond.clone(),
+            new_base,
+            recur_form,
+        ]));
+
+        // (loop bindings new_if)
+        let loop_form = Value::List(Arc::new(vec![
+            Value::Symbol(Arc::new("loop".to_string())),
+            Value::Vec(Arc::new(bindings)),
+            new_if,
+        ]));
+
+        vec![loop_form]
+    }
+
+    /// Check if an expression is a self-call: (fn_name ...)
+    fn is_self_call(fn_name: &str, expr: &Value) -> bool {
+        if let Value::List(items) = expr {
+            if let Some(Value::Symbol(sym)) = items.first() {
+                return sym.as_str() == fn_name;
+            }
+        }
+        false
+    }
+
     /// TCO: If a function body contains tail-recursive self-calls, wrap it in loop/recur.
     /// Returns the (possibly transformed) body.
     fn apply_tco(fn_name: &str, params: &[Value], body: &[Value]) -> Vec<Value> {
@@ -1991,8 +2104,10 @@ impl Compiler {
         }).collect();
 
         for (name, params, body) in &defuns {
+            // Binary recursion opt: (+ (f a) (f b)) → loop + single call
+            let body = Self::apply_binary_recursion_opt(name, params, body);
             // TCO: transform tail-recursive self-calls into loop/recur
-            let body = Self::apply_tco(name, params, body);
+            let body = Self::apply_tco(name, params, &body);
             self.compile_defun(name, params, &body)?;
         }
 
