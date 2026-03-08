@@ -8,11 +8,40 @@ use lisprint_core::prelude;
 
 mod project;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_help() {
+    println!("lisprint v{}", VERSION);
+    println!();
+    println!("Usage: lisprint <command> [options]");
+    println!();
+    println!("Commands:");
+    println!("  new <name>              Create a new project");
+    println!("  init                    Initialize project in current directory");
+    println!("  add <pkg>               Add a dependency to lisp.toml");
+    println!("  run [file]              Run a .lisp file (or project src/main.lisp)");
+    println!("  build [file] [output]   Compile to native binary (or project)");
+    println!("  test [files...]         Run tests (*_test.lisp)");
+    println!("  check [file]            Check syntax without running");
+    println!("  eval '<expr>'           Evaluate an expression");
+    println!("  repl                    Start interactive REPL (default)");
+    println!();
+    println!("Options:");
+    println!("  -h, --help              Show this help");
+    println!("  -v, --version           Show version");
+    println!("  --container             Generate Dockerfile (with build)");
+}
+
 fn main() {
     let args: Vec<String> = std_env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
-        Some("repl") | None => run_repl(),
+        Some("-h") | Some("--help") | Some("help") => {
+            print_help();
+        }
+        Some("-v") | Some("--version") | Some("version") => {
+            println!("lisprint v{}", VERSION);
+        }
         Some("new") => {
             if let Some(name) = args.get(2) {
                 if let Err(e) = project::new_project(name) {
@@ -41,6 +70,29 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("eval") => {
+            if let Some(expr) = args.get(2) {
+                eval_expr(expr);
+            } else {
+                eprintln!("Usage: lisprint eval '<expression>'");
+                std::process::exit(1);
+            }
+        }
+        Some("check") => {
+            if let Some(path) = args.get(2) {
+                check_file(path);
+            } else if let Some(proj) = project::Project::find() {
+                let entry = proj.entry_file();
+                if !entry.exists() {
+                    eprintln!("Entry file not found: {}", entry.display());
+                    std::process::exit(1);
+                }
+                check_file(&entry.to_string_lossy());
+            } else {
+                eprintln!("Usage: lisprint check <file.lisp>");
+                std::process::exit(1);
+            }
+        }
         Some("run") => {
             if let Some(path) = args.get(2) {
                 run_file(path);
@@ -52,7 +104,7 @@ fn main() {
                 }
                 run_file_with_deps(&entry.to_string_lossy(), &proj);
             } else {
-                eprintln!("Usage: lisprint run <file.lisp>");
+                eprintln!("Usage: lisprint run [file.lisp]");
                 eprintln!("  Or run from a project directory with lisp.toml");
                 std::process::exit(1);
             }
@@ -81,16 +133,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("repl") | None => run_repl(),
         Some(cmd) => {
             eprintln!("Unknown command: {}", cmd);
-            eprintln!("Usage: lisprint [new|init|add|repl|run|build|test]");
+            eprintln!("Run 'lisprint --help' for usage.");
             std::process::exit(1);
         }
     }
 }
 
 fn run_repl() {
-    println!("lisprint v0.1.0");
+    println!("lisprint v{}", VERSION);
     println!("Type (quit) to exit.\n");
 
     let mut env = Env::new();
@@ -419,6 +472,54 @@ ENTRYPOINT ["/app"]
         println!();
         println!("Note: For scratch containers, rebuild with a static-linked binary:");
         println!("  Cross-compile with musl: CC=musl-gcc lisprint build {} {} --container", path, output_name);
+    }
+}
+
+fn eval_expr(expr: &str) {
+    let mut env = Env::new();
+    builtins::register(&mut env);
+    prelude::load(&mut env).expect("failed to load prelude");
+
+    match parser::parse(expr) {
+        Ok(exprs) => {
+            for e in &exprs {
+                match eval::eval(e, &mut env) {
+                    Ok(val) => {
+                        if !val.is_nil() {
+                            println!("{}", val);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn check_file(path: &str) {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+
+    match parser::parse(&source) {
+        Ok(exprs) => {
+            println!("{}: OK ({} expressions)", path, exprs.len());
+        }
+        Err(e) => {
+            eprintln!("{}: Parse error: {}", path, e);
+            std::process::exit(1);
+        }
     }
 }
 
