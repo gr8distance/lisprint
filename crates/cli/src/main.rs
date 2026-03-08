@@ -102,7 +102,11 @@ fn main() {
                     eprintln!("Entry file not found: {}", entry.display());
                     std::process::exit(1);
                 }
-                run_file_with_deps(&entry.to_string_lossy(), &proj);
+                if proj.has_bridges() {
+                    run_with_bridges(&proj);
+                } else {
+                    run_file_with_deps(&entry.to_string_lossy(), &proj);
+                }
             } else {
                 eprintln!("Usage: lisprint run [file.lisp]");
                 eprintln!("  Or run from a project directory with lisp.toml");
@@ -126,7 +130,11 @@ fn main() {
                     eprintln!("Entry file not found: {}", entry.display());
                     std::process::exit(1);
                 }
-                build_binary(&entry.to_string_lossy(), Some(proj.name.as_str()), container);
+                if proj.has_bridges() {
+                    build_with_bridges(&proj);
+                } else {
+                    build_binary(&entry.to_string_lossy(), Some(proj.name.as_str()), container);
+                }
             } else {
                 eprintln!("Usage: lisprint build [file.lisp] [output] [--container]");
                 eprintln!("  Or run from a project directory with lisp.toml");
@@ -473,6 +481,44 @@ ENTRYPOINT ["/app"]
         println!();
         println!("Note: For scratch containers, rebuild with a static-linked binary:");
         println!("  Cross-compile with musl: CC=musl-gcc lisprint build {} {} --container", path, output_name);
+    }
+}
+
+fn run_with_bridges(proj: &project::Project) {
+    match project::build_bridge_project(proj) {
+        Ok(binary) => {
+            let status = std::process::Command::new(&binary)
+                .status();
+            match status {
+                Ok(s) if !s.success() => std::process::exit(s.code().unwrap_or(1)),
+                Err(e) => {
+                    eprintln!("Failed to run binary: {}", e);
+                    std::process::exit(1);
+                }
+                _ => {}
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn build_with_bridges(proj: &project::Project) {
+    match project::build_bridge_project(proj) {
+        Ok(binary) => {
+            let output = proj.root.join(&proj.name);
+            if let Err(e) = std::fs::copy(&binary, &output) {
+                eprintln!("Error copying binary: {}", e);
+                std::process::exit(1);
+            }
+            println!("Built: {}", proj.name);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
