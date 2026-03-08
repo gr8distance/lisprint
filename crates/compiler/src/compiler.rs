@@ -974,11 +974,51 @@ impl Compiler {
         if args.len() != 2 {
             return Err(format!("{} requires 2 arguments", op));
         }
-        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
-        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
 
         use cranelift_codegen::ir::condcodes::IntCC;
-        let cc = match op {
+
+        // Type-inference fast path: if both operands are known-Int, emit direct icmp
+        let lhs_type = Self::expr_type(&args[0], scope);
+        let rhs_type = Self::expr_type(&args[1], scope);
+
+        if lhs_type.is_known_int() && rhs_type.is_known_int() {
+            let (_, lhs_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+            let (_, rhs_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+            let cc = match op {
+                "=" => IntCC::Equal,
+                "!=" => IntCC::NotEqual,
+                "<" => IntCC::SignedLessThan,
+                ">" => IntCC::SignedGreaterThan,
+                "<=" => IntCC::SignedLessThanOrEqual,
+                ">=" => IntCC::SignedGreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            let cmp_result = builder.ins().icmp(cc, lhs_payload, rhs_payload);
+            let tag = builder.ins().iconst(types::I64, TAG_BOOL);
+            let payload = builder.ins().uextend(types::I64, cmp_result);
+            return Ok((tag, payload));
+        }
+
+        // General path: handle int/float dispatch
+        let (lhs_tag, lhs_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let (rhs_tag, rhs_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+
+        // Check if either operand is float
+        let lhs_is_float = builder.ins().icmp_imm(IntCC::Equal, lhs_tag, TAG_FLOAT);
+        let rhs_is_float = builder.ins().icmp_imm(IntCC::Equal, rhs_tag, TAG_FLOAT);
+        let any_float = builder.ins().bor(lhs_is_float, rhs_is_float);
+
+        let int_block = builder.create_block();
+        let float_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, types::I64); // result payload (bool as i64)
+
+        builder.ins().brif(any_float, float_block, &[], int_block, &[]);
+
+        // Integer comparison path
+        builder.switch_to_block(int_block);
+        builder.seal_block(int_block);
+        let int_cc = match op {
             "=" => IntCC::Equal,
             "!=" => IntCC::NotEqual,
             "<" => IntCC::SignedLessThan,
@@ -987,11 +1027,35 @@ impl Compiler {
             ">=" => IntCC::SignedGreaterThanOrEqual,
             _ => unreachable!(),
         };
+        let int_cmp = builder.ins().icmp(int_cc, lhs_payload, rhs_payload);
+        let int_result = builder.ins().uextend(types::I64, int_cmp);
+        builder.ins().jump(merge_block, &[int_result]);
 
-        let cmp_result = builder.ins().icmp(cc, lhs, rhs);
+        // Float comparison path: convert both to f64, then fcmp
+        builder.switch_to_block(float_block);
+        builder.seal_block(float_block);
+        let lhs_f = Self::emit_to_f64(lhs_tag, lhs_payload, builder);
+        let rhs_f = Self::emit_to_f64(rhs_tag, rhs_payload, builder);
+        use cranelift_codegen::ir::condcodes::FloatCC;
+        let float_cc = match op {
+            "=" => FloatCC::Equal,
+            "!=" => FloatCC::NotEqual,
+            "<" => FloatCC::LessThan,
+            ">" => FloatCC::GreaterThan,
+            "<=" => FloatCC::LessThanOrEqual,
+            ">=" => FloatCC::GreaterThanOrEqual,
+            _ => unreachable!(),
+        };
+        let float_cmp = builder.ins().fcmp(float_cc, lhs_f, rhs_f);
+        let float_result = builder.ins().uextend(types::I64, float_cmp);
+        builder.ins().jump(merge_block, &[float_result]);
+
+        // Merge
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        let result_payload = builder.block_params(merge_block)[0];
         let tag = builder.ins().iconst(types::I64, TAG_BOOL);
-        let payload = builder.ins().uextend(types::I64, cmp_result);
-        Ok((tag, payload))
+        Ok((tag, result_payload))
     }
 
     /// (not expr)
@@ -1887,6 +1951,30 @@ mod tests {
     fn test_compile_list_with_higher_order() {
         // Build a list, pass to a function that uses first/rest
         let exprs = parse("(defun head (lst) (first lst)) (head (list 10 20 30))").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_float_comparison() {
+        let exprs = parse("(< 1.5 2.5)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        let exprs = parse("(= 3.14 3.14)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        // Mixed int/float comparison
+        let exprs = parse("(> 2.0 1)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_cmp_known_int_fast_path() {
+        // fib uses (< n 2) where n is known-Int — should take the fast path
+        let exprs = parse("(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 10)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+
+        // Factorial uses (= n 0) where n is known-Int
+        let exprs = parse("(defun fact (n) (if (= n 0) 1 (* n (fact (- n 1))))) (fact 5)").unwrap();
         assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
     }
 }
