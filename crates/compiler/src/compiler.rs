@@ -523,7 +523,7 @@ impl Compiler {
 
     /// Quick type check for an expression using scope type annotations.
     /// Used by emit_arith to skip tag dispatch when types are known.
-    fn expr_type(expr: &Value, scope: &FnScope) -> LType {
+    fn expr_type(expr: &Value, scope: &FnScope, functions: &HashMap<String, (FuncId, usize, Option<i64>)>) -> LType {
         match expr {
             Value::Int(_) => LType::Int,
             Value::Float(_) => LType::Float,
@@ -537,8 +537,8 @@ impl Compiler {
                 if let Some(Value::Symbol(sym)) = items.first() {
                     match sym.as_str() {
                         "+" | "-" | "*" | "/" | "%" if items.len() == 3 => {
-                            let lhs = Self::expr_type(&items[1], scope);
-                            let rhs = Self::expr_type(&items[2], scope);
+                            let lhs = Self::expr_type(&items[1], scope, functions);
+                            let rhs = Self::expr_type(&items[2], scope, functions);
                             match (&lhs, &rhs) {
                                 (LType::Int, LType::Int) => LType::Int,
                                 (LType::Float, LType::Float) => LType::Float,
@@ -548,7 +548,30 @@ impl Compiler {
                         }
                         "=" | "<" | ">" | "<=" | ">=" | "!=" | "not" => LType::Bool,
                         "count" => LType::Int,
-                        _ => LType::Any,
+                        "if" if items.len() >= 3 => {
+                            let then_ty = Self::expr_type(&items[2], scope, functions);
+                            let else_ty = if items.len() >= 4 {
+                                Self::expr_type(&items[3], scope, functions)
+                            } else {
+                                LType::Nil
+                            };
+                            if then_ty == else_ty { then_ty } else { LType::Any }
+                        }
+                        _ => {
+                            // Function call: look up return type from unboxed fn info
+                            if let Some(&(_, _, Some(ret_tag))) = functions.get(sym.as_str()) {
+                                match ret_tag {
+                                    TAG_INT => LType::Int,
+                                    TAG_FLOAT => LType::Float,
+                                    TAG_BOOL => LType::Bool,
+                                    TAG_STR => LType::Str,
+                                    TAG_NIL => LType::Nil,
+                                    _ => LType::Any,
+                                }
+                            } else {
+                                LType::Any
+                            }
+                        }
                     }
                 } else {
                     LType::Any
@@ -1037,7 +1060,7 @@ impl Compiler {
         }
         let name = args[0].as_symbol().map_err(|e| e.to_string())?;
         let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
-        let ty = Self::expr_type(&args[1], scope);
+        let ty = Self::expr_type(&args[1], scope, functions);
         let slot = scope.declare_typed_var(name, &ty, builder);
         match slot {
             VarSlot::Boxed(tag_var, payload_var) => {
@@ -1084,7 +1107,7 @@ impl Compiler {
         }
 
         // Fast path: if condition is known-Bool (e.g., comparison result), skip tag checks
-        let cond_type = Self::expr_type(&args[0], scope);
+        let cond_type = Self::expr_type(&args[0], scope, functions);
         let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
 
         let is_falsy = if cond_type == LType::Bool {
@@ -1160,7 +1183,7 @@ impl Compiler {
         for chunk in bindings.chunks(2) {
             let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
             let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
-            let ty = Self::expr_type(&chunk[1], scope);
+            let ty = Self::expr_type(&chunk[1], scope, functions);
             let slot = scope.declare_typed_var(name, &ty, builder);
             match slot {
                 VarSlot::Boxed(tag_var, payload_var) => {
@@ -1202,8 +1225,8 @@ impl Compiler {
         }
 
         // Type-inference fast path: if both operands are known-Int, skip tag dispatch
-        let lhs_type = Self::expr_type(&args[0], scope);
-        let rhs_type = Self::expr_type(&args[1], scope);
+        let lhs_type = Self::expr_type(&args[0], scope, functions);
+        let rhs_type = Self::expr_type(&args[1], scope, functions);
 
         if lhs_type.is_known_int() && rhs_type.is_known_int() {
             let (_, lhs_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
@@ -1332,8 +1355,8 @@ impl Compiler {
         use cranelift_codegen::ir::condcodes::IntCC;
 
         // Type-inference fast path: if both operands are known-Int, emit direct icmp
-        let lhs_type = Self::expr_type(&args[0], scope);
-        let rhs_type = Self::expr_type(&args[1], scope);
+        let lhs_type = Self::expr_type(&args[0], scope, functions);
+        let rhs_type = Self::expr_type(&args[1], scope, functions);
 
         if lhs_type.is_known_int() && rhs_type.is_known_int() {
             let (_, lhs_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
@@ -1635,7 +1658,7 @@ impl Compiler {
         for chunk in bindings.chunks(2) {
             let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
             bind_names.push(name.to_string());
-            let ty = Self::expr_type(&chunk[1], scope);
+            let ty = Self::expr_type(&chunk[1], scope, functions);
             bind_unboxed.push(ltype_to_tag(&ty));
             let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
             init_tags.push(tag);
@@ -1841,7 +1864,7 @@ impl Compiler {
             return Err("if requires 2 or 3 arguments".to_string());
         }
 
-        let cond_type = Self::expr_type(&args[0], scope);
+        let cond_type = Self::expr_type(&args[0], scope, functions);
         let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
 
         let is_falsy = if cond_type == LType::Bool {
