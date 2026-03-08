@@ -33,8 +33,26 @@ lisprint/
 │   │   └── runtime.rs       # bridge 関数 (FFI)
 │   └── cli/                 # lisprint (バイナリ)
 │       ├── main.rs          # CLI コマンド + REPL
-│       └── project.rs       # プロジェクト管理 (lisp.toml)
+│       └── project.rs       # プロジェクト管理 (lisp.toml, Bridge)
 └── docs/
+```
+
+### ユーザープロジェクト構成 (Bridge 使用時)
+
+```
+my-app/
+├── lisp.toml              # プロジェクト設定 + [dependencies]
+├── bridge/                # ユーザー Bridge (Rust FFI)
+│   └── <crate>.rs         # register(env) で関数を環境に登録
+├── src/
+│   └── main.lisp          # エントリポイント
+└── .lisprint/build/       # 自動生成 (gitignore 推奨)
+    ├── Cargo.toml          # dependencies + lisprint-core path dep
+    └── src/
+        ├── main.rs         # Lisp ファイル埋め込み + bridge 呼び出し
+        └── bridges/
+            ├── mod.rs      # mod <crate>; register_all()
+            └── <crate>.rs  # bridge/ からコピー
 ```
 
 ## 設計方針
@@ -79,6 +97,29 @@ fn registry() -> HashMap<&'static str, ModuleRegisterFn> { ... }
 ```
 `require` 時に名前からレジストリを引き、`register(&mut env)` で関数群を環境に登録。
 
+### ユーザー Bridge
+ユーザーが `lisprint add <crate>` で追加した Rust クレートを Lisp から利用する仕組み。
+
+**フロー:**
+1. `lisprint add <crate>` → lisp.toml に依存追加 + `bridge/<crate>.rs` テンプレート生成
+2. ユーザーが `bridge/<crate>.rs` の `register(env)` 内で関数を定義
+3. `lisprint run` / `build` 時に bridge/ があれば自動で:
+   - `.lisprint/build/` に Cargo プロジェクトを生成
+   - `Cargo.toml` にユーザーの依存 + `lisprint-core` (path dep) を記述
+   - `src/main.rs` に Lisp ソースを埋め込み + bridge 呼び出しコード生成
+   - `cargo build --release` で実行バイナリを生成
+4. 生成されたバイナリを実行 (`run`) またはコピー (`build`)
+
+**Bridge ファイルの規約:**
+```rust
+pub fn register(env: &mut Env) {
+    env.define("<crate>/func_name", Value::NativeFn(Arc::new(NativeFnData {
+        name: "<crate>/func_name".to_string(),
+        func: Box::new(|args| { ... }),
+    })));
+}
+```
+
 ## テスト
 
 - **Core**: 94 テスト (eval + parser)
@@ -97,4 +138,5 @@ cargo test
 | 2 | マクロ + prelude | 完了 |
 | 3 | Rust クレート bridge (stdlib 11モジュール) | 完了 |
 | 4 | Cranelift ネイティブコンパイル | 完了 |
+| 5 | ユーザー Bridge システム | 完了 |
 | Extra | フロー型推論パス | 未着手 |

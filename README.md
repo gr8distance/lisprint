@@ -65,6 +65,8 @@ lisprint build --container       Dockerfile も生成
 ```
 my-app/
 ├── lisp.toml          # プロジェクト設定
+├── bridge/            # ユーザー Bridge (Rust FFI)
+│   └── <crate>.rs     # lisprint add で生成
 └── src/
     └── main.lisp      # エントリポイント
 ```
@@ -80,6 +82,45 @@ version = "0.1.0"
 json = "*"
 http = "*"
 ```
+
+## Bridge システム
+
+任意の Rust クレートを Lisp から使えるようにする仕組み。Elixir の `mix deps.compile` に似たワークフロー。
+
+```bash
+# 1. クレート追加 (lisp.toml に追記 + bridge/ テンプレート生成)
+lisprint add uuidv4
+
+# 2. bridge/uuidv4.rs を編集して関数を公開
+# 3. lisprint run / build で自動コンパイル
+lisprint run
+```
+
+**bridge/uuidv4.rs の例:**
+
+```rust
+use lisprint_core::env::Env;
+use lisprint_core::value::{Value, NativeFnData};
+use std::sync::Arc;
+
+pub fn register(env: &mut Env) {
+    env.define("uuidv4/generate", Value::NativeFn(Arc::new(NativeFnData {
+        name: "uuidv4/generate".to_string(),
+        func: Box::new(|_args| {
+            let id = uuidv4::uuid::v4();
+            Ok(Value::str(id))
+        }),
+    })));
+}
+```
+
+**Lisp 側で使う:**
+
+```lisp
+(println (uuidv4/generate))  ;; => "a3f2b1c4-..."
+```
+
+Bridge がある場合、`lisprint run` / `lisprint build` は自動的に `.lisprint/build/` に Cargo プロジェクトを生成し、bridge コードを含むバイナリをビルドして実行する。
 
 ## 言語の例
 
@@ -146,6 +187,7 @@ lisprint test
 - [x] Phase 2: マクロ + 標準ライブラリ (prelude)
 - [x] Phase 3: Rust クレート bridge (stdlib 11モジュール)
 - [x] Phase 4: Cranelift ネイティブコンパイル
+- [x] Phase 5: ユーザー Bridge システム (任意 Rust クレートの Lisp バインディング)
 - [ ] Extra: フロー型推論パス
 
 ## License

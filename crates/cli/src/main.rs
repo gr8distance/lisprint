@@ -413,6 +413,105 @@ TaggedValue lsp_to_string(int64_t tag, int64_t payload) {
     return (TaggedValue){TAG_STR, (int64_t)result};
 }
 
+// --- Data structure runtime ---
+#define TAG_LIST  6
+
+typedef struct { size_t len; int64_t (*data)[2]; } RuntimeList;
+
+static TaggedValue make_list(int64_t (*items)[2], size_t len) {
+    RuntimeList* rl = malloc(sizeof(RuntimeList));
+    int64_t (*data)[2] = malloc(len * sizeof(int64_t[2]));
+    memcpy(data, items, len * sizeof(int64_t[2]));
+    rl->len = len;
+    rl->data = data;
+    return (TaggedValue){TAG_LIST, (int64_t)rl};
+}
+
+static void get_list(int64_t payload, int64_t (**out)[2], size_t *out_len) {
+    if (payload == 0) { *out = NULL; *out_len = 0; return; }
+    RuntimeList* rl = (RuntimeList*)payload;
+    *out = rl->data;
+    *out_len = rl->len;
+}
+
+TaggedValue lsp_cons(int64_t et, int64_t ep, int64_t lt, int64_t lp) {
+    int64_t (*old)[2]; size_t old_len;
+    if (lt == TAG_LIST) { get_list(lp, &old, &old_len); }
+    else if (lt == TAG_NIL) { old = NULL; old_len = 0; }
+    else { old = NULL; old_len = 0; }
+    size_t new_len = 1 + old_len;
+    int64_t (*items)[2] = malloc(new_len * sizeof(int64_t[2]));
+    items[0][0] = et; items[0][1] = ep;
+    if (old_len > 0) memcpy(items + 1, old, old_len * sizeof(int64_t[2]));
+    RuntimeList* rl = malloc(sizeof(RuntimeList));
+    rl->len = new_len; rl->data = items;
+    return (TaggedValue){TAG_LIST, (int64_t)rl};
+}
+
+TaggedValue lsp_first(int64_t ct, int64_t cp) {
+    if (ct == TAG_LIST) {
+        int64_t (*d)[2]; size_t len;
+        get_list(cp, &d, &len);
+        if (len > 0) return (TaggedValue){d[0][0], d[0][1]};
+    }
+    return (TaggedValue){TAG_NIL, 0};
+}
+
+TaggedValue lsp_rest(int64_t ct, int64_t cp) {
+    if (ct == TAG_LIST) {
+        int64_t (*d)[2]; size_t len;
+        get_list(cp, &d, &len);
+        if (len > 1) return make_list(d + 1, len - 1);
+    }
+    int64_t empty[1][2];
+    return make_list(empty, 0);
+}
+
+TaggedValue lsp_nth(int64_t ct, int64_t cp, int64_t it, int64_t ip) {
+    if (ct == TAG_LIST) {
+        int64_t (*d)[2]; size_t len;
+        get_list(cp, &d, &len);
+        size_t idx = (size_t)ip;
+        if (idx < len) return (TaggedValue){d[idx][0], d[idx][1]};
+    }
+    return (TaggedValue){TAG_NIL, 0};
+}
+
+TaggedValue lsp_count(int64_t ct, int64_t cp) {
+    if (ct == TAG_LIST) {
+        int64_t (*d)[2]; size_t len;
+        get_list(cp, &d, &len);
+        return (TaggedValue){TAG_INT, (int64_t)len};
+    }
+    if (ct == TAG_NIL) return (TaggedValue){TAG_INT, 0};
+    if (ct == TAG_STR) return (TaggedValue){TAG_INT, (int64_t)strlen((const char*)cp)};
+    return (TaggedValue){TAG_INT, 0};
+}
+
+TaggedValue lsp_empty_q(int64_t ct, int64_t cp) {
+    if (ct == TAG_LIST) {
+        int64_t (*d)[2]; size_t len;
+        get_list(cp, &d, &len);
+        return (TaggedValue){TAG_BOOL, len == 0 ? 1 : 0};
+    }
+    if (ct == TAG_NIL) return (TaggedValue){TAG_BOOL, 1};
+    return (TaggedValue){TAG_BOOL, 0};
+}
+
+TaggedValue lsp_concat(int64_t at, int64_t ap, int64_t bt, int64_t bp) {
+    int64_t (*ad)[2] = NULL; size_t alen = 0;
+    int64_t (*bd)[2] = NULL; size_t blen = 0;
+    if (at == TAG_LIST) get_list(ap, &ad, &alen);
+    if (bt == TAG_LIST) get_list(bp, &bd, &blen);
+    size_t total = alen + blen;
+    int64_t (*items)[2] = malloc(total * sizeof(int64_t[2]));
+    if (alen > 0) memcpy(items, ad, alen * sizeof(int64_t[2]));
+    if (blen > 0) memcpy(items + alen, bd, blen * sizeof(int64_t[2]));
+    RuntimeList* rl = malloc(sizeof(RuntimeList));
+    rl->len = total; rl->data = items;
+    return (TaggedValue){TAG_LIST, (int64_t)rl};
+}
+
 // Compiled Lisp entry point
 extern void _lsp_main(int64_t* ret_tag, int64_t* ret_payload);
 
