@@ -95,6 +95,12 @@ impl FnScope {
     }
 }
 
+/// Check if all types in a function signature are concrete (can be unboxed)
+fn is_unboxable(param_types: &[LType], ret_type: &LType) -> bool {
+    let concrete = |ty: &LType| ltype_to_tag(ty).is_some();
+    param_types.iter().all(concrete) && concrete(ret_type)
+}
+
 /// Cranelift-based compiler for lisprint
 pub struct Compiler {
     module: ObjectModule,
@@ -102,9 +108,12 @@ pub struct Compiler {
     func_ctx: FunctionBuilderContext,
     strings: HashMap<String, DataId>,
     next_str_id: usize,
-    /// Declared functions: name → (FuncId, param_count)
-    functions: HashMap<String, (FuncId, usize)>,
+    /// Declared functions: name → (FuncId, param_count, unboxed_ret_tag)
+    /// unboxed_ret_tag: Some(tag) if unboxed calling convention, None if boxed
+    functions: HashMap<String, (FuncId, usize, Option<i64>)>,
     next_func_idx: u32,
+    /// Functions using unboxed calling convention: name → (param_types, return_type)
+    unboxed_fns: HashMap<String, (Vec<LType>, LType)>,
     /// Bridge (runtime) functions: name → FuncId
     bridges: HashMap<String, FuncId>,
     /// Pending anonymous functions to compile: (generated_name, params, body)
@@ -150,6 +159,7 @@ impl Compiler {
             bridges: HashMap::new(),
             pending_anons: Vec::new(),
             fn_types: HashMap::new(),
+            unboxed_fns: HashMap::new(),
             bridge_mode: false,
         };
         compiler.declare_bridges()?;
@@ -319,6 +329,16 @@ impl Compiler {
         sig
     }
 
+    /// Create an unboxed function signature: payload-only params and single payload return
+    fn make_unboxed_fn_sig(&self, param_count: usize) -> cranelift_codegen::ir::Signature {
+        let mut sig = self.module.make_signature();
+        for _ in 0..param_count {
+            sig.params.push(AbiParam::new(types::I64)); // payload only
+        }
+        sig.returns.push(AbiParam::new(types::I64)); // return payload only
+        sig
+    }
+
     /// Compute a deterministic key for an anonymous fn expression.
     /// Both the pre-declaration pass and emit pass compute the same key
     /// from the expression's structural content.
@@ -395,7 +415,7 @@ impl Compiler {
                             let func_id = self.module
                                 .declare_function(&key, Linkage::Local, &sig)
                                 .map_err(|e| e.to_string())?;
-                            self.functions.insert(key.clone(), (func_id, param_count));
+                            self.functions.insert(key.clone(), (func_id, param_count, None));
                             self.pending_anons.push((key, params, body));
                         }
                     }
@@ -410,7 +430,8 @@ impl Compiler {
         Ok(())
     }
 
-    /// Pre-pass: declare all top-level defun functions in the module
+    /// Pre-pass: declare all top-level defun functions in the module.
+    /// Uses type inference results to generate unboxed signatures where possible.
     fn declare_functions(&mut self, exprs: &[Value]) -> Result<(), String> {
         for expr in exprs {
             if let Value::List(items) = expr {
@@ -418,15 +439,30 @@ impl Compiler {
                     if let Value::Symbol(sym) = &items[0] {
                         if sym.as_str() == "defun" {
                             if let Value::Symbol(name) = &items[1] {
-                                // (defun name (params...) body...)
                                 if let Value::List(params) = &items[2] {
                                     let param_count = params.len();
-                                    let sig = self.make_fn_sig(param_count);
                                     let func_name = format!("_lsp_fn_{}", name);
+
+                                    // Check if this function can use unboxed calling convention
+                                    let use_unboxed = if let Some((ptypes, rtype)) = self.fn_types.get(name.as_str()) {
+                                        is_unboxable(ptypes, rtype)
+                                    } else {
+                                        false
+                                    };
+
+                                    let (sig, ret_tag) = if use_unboxed {
+                                        let (ptypes, rtype) = self.fn_types.get(name.as_str()).unwrap().clone();
+                                        let tag = ltype_to_tag(&rtype).unwrap();
+                                        self.unboxed_fns.insert(name.to_string(), (ptypes, rtype));
+                                        (self.make_unboxed_fn_sig(param_count), Some(tag))
+                                    } else {
+                                        (self.make_fn_sig(param_count), None)
+                                    };
+
                                     let func_id = self.module
                                         .declare_function(&func_name, Linkage::Local, &sig)
                                         .map_err(|e| e.to_string())?;
-                                    self.functions.insert(name.to_string(), (func_id, param_count));
+                                    self.functions.insert(name.to_string(), (func_id, param_count, ret_tag));
                                 }
                             }
                         }
@@ -445,10 +481,15 @@ impl Compiler {
             .map_err(|e| e.to_string())?;
 
         let param_count = param_names.len();
-        let (func_id, _) = *self.functions.get(name)
+        let (func_id, _, _) = *self.functions.get(name)
             .ok_or_else(|| format!("function {} not declared", name))?;
 
-        let sig = self.make_fn_sig(param_count);
+        let is_unboxed = self.unboxed_fns.contains_key(name);
+        let sig = if is_unboxed {
+            self.make_unboxed_fn_sig(param_count)
+        } else {
+            self.make_fn_sig(param_count)
+        };
         self.ctx.func.signature = sig;
         self.ctx.func.name = UserFuncName::user(0, self.next_func_idx);
         self.next_func_idx += 1;
@@ -462,26 +503,45 @@ impl Compiler {
 
             let mut scope = FnScope::new();
 
-            // Bind parameters — use unboxed vars when type is known from inference
+            // Bind parameters
             let param_types_opt = self.fn_types.get(name).cloned();
-            for (i, param_name) in param_names.iter().enumerate() {
-                let tag_val = builder.block_params(entry_block)[i * 2];
-                let payload_val = builder.block_params(entry_block)[i * 2 + 1];
-
-                let ty = param_types_opt.as_ref()
-                    .and_then(|(pts, _)| pts.get(i))
-                    .cloned()
-                    .unwrap_or(LType::Any);
-
-                let slot = scope.declare_typed_var(param_name, &ty, &mut builder);
-                match slot {
-                    VarSlot::Boxed(tag_var, payload_var) => {
-                        builder.def_var(tag_var, tag_val);
-                        builder.def_var(payload_var, payload_val);
+            if is_unboxed {
+                // Unboxed: each block param is just a payload (one per param)
+                for (i, param_name) in param_names.iter().enumerate() {
+                    let payload_val = builder.block_params(entry_block)[i];
+                    let ty = param_types_opt.as_ref()
+                        .and_then(|(pts, _)| pts.get(i))
+                        .cloned()
+                        .unwrap_or(LType::Any);
+                    let slot = scope.declare_typed_var(param_name, &ty, &mut builder);
+                    match slot {
+                        VarSlot::Unboxed(payload_var, _) => {
+                            builder.def_var(payload_var, payload_val);
+                        }
+                        VarSlot::Boxed(_, payload_var) => {
+                            // Shouldn't happen for unboxed fn, but handle gracefully
+                            builder.def_var(payload_var, payload_val);
+                        }
                     }
-                    VarSlot::Unboxed(payload_var, _) => {
-                        // Tag from ABI is discarded (dead code); only store payload
-                        builder.def_var(payload_var, payload_val);
+                }
+            } else {
+                // Boxed: each param is (tag, payload) pair
+                for (i, param_name) in param_names.iter().enumerate() {
+                    let tag_val = builder.block_params(entry_block)[i * 2];
+                    let payload_val = builder.block_params(entry_block)[i * 2 + 1];
+                    let ty = param_types_opt.as_ref()
+                        .and_then(|(pts, _)| pts.get(i))
+                        .cloned()
+                        .unwrap_or(LType::Any);
+                    let slot = scope.declare_typed_var(param_name, &ty, &mut builder);
+                    match slot {
+                        VarSlot::Boxed(tag_var, payload_var) => {
+                            builder.def_var(tag_var, tag_val);
+                            builder.def_var(payload_var, payload_val);
+                        }
+                        VarSlot::Unboxed(payload_var, _) => {
+                            builder.def_var(payload_var, payload_val);
+                        }
                     }
                 }
             }
@@ -504,7 +564,12 @@ impl Compiler {
                 last_payload = payload;
             }
 
-            builder.ins().return_(&[last_tag, last_payload]);
+            if is_unboxed {
+                // Unboxed return: just the payload
+                builder.ins().return_(&[last_payload]);
+            } else {
+                builder.ins().return_(&[last_tag, last_payload]);
+            }
             builder.finalize();
         }
 
@@ -519,7 +584,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -607,7 +672,7 @@ impl Compiler {
 
                             // Look up the pre-declared anonymous function by content hash
                             let key = Self::anon_key(expr);
-                            let (func_id, _) = *functions.get(&key)
+                            let (func_id, _, _) = *functions.get(&key)
                                 .ok_or_else(|| format!("anonymous function not pre-declared: {}", key))?;
 
                             // Return (TAG_FN, func_pointer | arity << 48)
@@ -628,7 +693,7 @@ impl Compiler {
                     }
 
                     // Function call
-                    if let Some(&(func_id, param_count)) = functions.get(sym.as_str()) {
+                    if let Some(&(func_id, param_count, unboxed_ret)) = functions.get(sym.as_str()) {
                         let args_exprs = &items[1..];
                         if args_exprs.len() != param_count {
                             return Err(format!(
@@ -637,22 +702,38 @@ impl Compiler {
                             ));
                         }
 
-                        // Evaluate arguments
-                        let mut call_args = Vec::new();
-                        for arg_expr in args_exprs {
-                            let (tag, payload) = Self::emit_expr(
-                                arg_expr, builder, module, strings, functions, scope, bridges,
-                            )?;
-                            call_args.push(tag);
-                            call_args.push(payload);
+                        if let Some(ret_tag_const) = unboxed_ret {
+                            // Unboxed call: pass payloads only, get payload back
+                            let mut call_args = Vec::new();
+                            for arg_expr in args_exprs {
+                                let (_, payload) = Self::emit_expr(
+                                    arg_expr, builder, module, strings, functions, scope, bridges,
+                                )?;
+                                call_args.push(payload);
+                            }
+                            let local_func = module.declare_func_in_func(func_id, builder.func);
+                            let call = builder.ins().call(local_func, &call_args);
+                            let results = builder.inst_results(call);
+                            let ret_payload = results[0];
+                            let ret_tag = builder.ins().iconst(types::I64, ret_tag_const);
+                            return Ok((ret_tag, ret_payload));
+                        } else {
+                            // Boxed call: pass (tag, payload) pairs, get (tag, payload) back
+                            let mut call_args = Vec::new();
+                            for arg_expr in args_exprs {
+                                let (tag, payload) = Self::emit_expr(
+                                    arg_expr, builder, module, strings, functions, scope, bridges,
+                                )?;
+                                call_args.push(tag);
+                                call_args.push(payload);
+                            }
+                            let local_func = module.declare_func_in_func(func_id, builder.func);
+                            let call = builder.ins().call(local_func, &call_args);
+                            let results = builder.inst_results(call);
+                            let ret_tag = results[0];
+                            let ret_payload = results[1];
+                            return Ok((ret_tag, ret_payload));
                         }
-
-                        let local_func = module.declare_func_in_func(func_id, builder.func);
-                        let call = builder.ins().call(local_func, &call_args);
-                        let results = builder.inst_results(call);
-                        let ret_tag = results[0];
-                        let ret_payload = results[1];
-                        return Ok((ret_tag, ret_payload));
                     }
 
                     // Built-in operations (can be shadowed by user functions)
@@ -770,7 +851,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -799,7 +880,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -858,7 +939,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -911,7 +992,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1039,7 +1120,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1136,7 +1217,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1163,7 +1244,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1189,7 +1270,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1216,7 +1297,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1251,7 +1332,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1285,7 +1366,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1305,7 +1386,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1329,7 +1410,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1418,7 +1499,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
         loop_block: cranelift_codegen::ir::Block,
@@ -1449,7 +1530,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
         loop_block: cranelift_codegen::ir::Block,
@@ -1503,7 +1584,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
         loop_block: cranelift_codegen::ir::Block,
@@ -1583,7 +1664,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, (FuncId, usize, Option<i64>)>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -1606,16 +1687,16 @@ impl Compiler {
         // Pass 1: collect strings
         self.collect_strings(exprs)?;
 
-        // Pass 2: declare all top-level functions
-        self.declare_functions(exprs)?;
-
-        // Pass 2.5: scan for anonymous fn expressions and declare them
-        self.collect_anon_fns(exprs)?;
-
-        // Pass 2.75: type inference
+        // Pass 2: type inference (runs on AST, before function declaration)
         let mut type_infer = TypeInfer::new();
         type_infer.infer_program(exprs);
         self.fn_types = type_infer.into_fn_types();
+
+        // Pass 3: declare all top-level functions (uses type info for unboxed sigs)
+        self.declare_functions(exprs)?;
+
+        // Pass 3.5: scan for anonymous fn expressions and declare them (always boxed)
+        self.collect_anon_fns(exprs)?;
 
         // Pass 3: compile each defun
         // Collect defun info first to avoid borrow issues
