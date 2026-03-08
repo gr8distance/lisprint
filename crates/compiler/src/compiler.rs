@@ -22,10 +22,32 @@ pub const TAG_LIST: i64 = 6;
 pub const TAG_VEC: i64 = 7;
 pub const TAG_MAP: i64 = 8;
 
+/// Variable storage: boxed (tag + payload) or unboxed (payload only, type known at compile time).
+#[derive(Clone, Copy, Debug)]
+enum VarSlot {
+    /// Full tagged value: (tag_var, payload_var)
+    Boxed(Variable, Variable),
+    /// Unboxed: only payload stored, tag reconstructed from known type
+    Unboxed(Variable, i64), // (payload_var, tag_constant)
+}
+
+/// Convert a known LType to its runtime tag constant
+fn ltype_to_tag(ty: &LType) -> Option<i64> {
+    match ty {
+        LType::Nil => Some(TAG_NIL),
+        LType::Bool => Some(TAG_BOOL),
+        LType::Int => Some(TAG_INT),
+        LType::Float => Some(TAG_FLOAT),
+        LType::Str => Some(TAG_STR),
+        LType::Fn => Some(TAG_FN),
+        LType::List => Some(TAG_LIST),
+        _ => None, // Num, Any — cannot unbox
+    }
+}
+
 /// Tracks local variables within a function being compiled.
-/// Each Lisp value is represented as two Cranelift Variables: (tag, payload).
 struct FnScope {
-    locals: HashMap<String, (Variable, Variable)>,
+    locals: HashMap<String, VarSlot>,
     next_var: u32,
     /// Inferred types for local variables
     types: HashMap<String, LType>,
@@ -40,6 +62,7 @@ impl FnScope {
         }
     }
 
+    /// Declare a boxed variable (tag + payload). Used when type is unknown.
     fn declare_var(&mut self, name: &str, builder: &mut FunctionBuilder) -> (Variable, Variable) {
         let tag_var = Variable::from_u32(self.next_var);
         self.next_var += 1;
@@ -47,11 +70,27 @@ impl FnScope {
         self.next_var += 1;
         builder.declare_var(tag_var, types::I64);
         builder.declare_var(payload_var, types::I64);
-        self.locals.insert(name.to_string(), (tag_var, payload_var));
+        self.locals.insert(name.to_string(), VarSlot::Boxed(tag_var, payload_var));
         (tag_var, payload_var)
     }
 
-    fn get_var(&self, name: &str) -> Option<(Variable, Variable)> {
+    /// Declare a variable with known type — unboxed if possible, boxed otherwise.
+    fn declare_typed_var(&mut self, name: &str, ty: &LType, builder: &mut FunctionBuilder) -> VarSlot {
+        if let Some(tag) = ltype_to_tag(ty) {
+            let payload_var = Variable::from_u32(self.next_var);
+            self.next_var += 1;
+            builder.declare_var(payload_var, types::I64);
+            let slot = VarSlot::Unboxed(payload_var, tag);
+            self.locals.insert(name.to_string(), slot);
+            self.types.insert(name.to_string(), ty.clone());
+            slot
+        } else {
+            self.declare_var(name, builder);
+            self.locals.get(name).copied().unwrap()
+        }
+    }
+
+    fn get_var(&self, name: &str) -> Option<VarSlot> {
         self.locals.get(name).copied()
     }
 }
@@ -423,22 +462,28 @@ impl Compiler {
 
             let mut scope = FnScope::new();
 
-            // Set type annotations from type inference
-            if let Some((param_types, _)) = self.fn_types.get(name) {
-                for (i, param_name) in param_names.iter().enumerate() {
-                    if let Some(ty) = param_types.get(i) {
-                        scope.types.insert(param_name.clone(), ty.clone());
-                    }
-                }
-            }
-
-            // Bind parameters
+            // Bind parameters — use unboxed vars when type is known from inference
+            let param_types_opt = self.fn_types.get(name).cloned();
             for (i, param_name) in param_names.iter().enumerate() {
-                let (tag_var, payload_var) = scope.declare_var(param_name, &mut builder);
                 let tag_val = builder.block_params(entry_block)[i * 2];
                 let payload_val = builder.block_params(entry_block)[i * 2 + 1];
-                builder.def_var(tag_var, tag_val);
-                builder.def_var(payload_var, payload_val);
+
+                let ty = param_types_opt.as_ref()
+                    .and_then(|(pts, _)| pts.get(i))
+                    .cloned()
+                    .unwrap_or(LType::Any);
+
+                let slot = scope.declare_typed_var(param_name, &ty, &mut builder);
+                match slot {
+                    VarSlot::Boxed(tag_var, payload_var) => {
+                        builder.def_var(tag_var, tag_val);
+                        builder.def_var(payload_var, payload_val);
+                    }
+                    VarSlot::Unboxed(payload_var, _) => {
+                        // Tag from ABI is discarded (dead code); only store payload
+                        builder.def_var(payload_var, payload_val);
+                    }
+                }
             }
 
             // Compile body
@@ -512,12 +557,18 @@ impl Compiler {
 
             // Symbol reference (variable lookup)
             Value::Symbol(name) => {
-                if let Some((tag_var, payload_var)) = scope.get_var(name) {
-                    let tag = builder.use_var(tag_var);
-                    let payload = builder.use_var(payload_var);
-                    Ok((tag, payload))
-                } else {
-                    Err(format!("undefined variable: {}", name))
+                match scope.get_var(name) {
+                    Some(VarSlot::Boxed(tag_var, payload_var)) => {
+                        let tag = builder.use_var(tag_var);
+                        let payload = builder.use_var(payload_var);
+                        Ok((tag, payload))
+                    }
+                    Some(VarSlot::Unboxed(payload_var, tag_const)) => {
+                        let tag = builder.ins().iconst(types::I64, tag_const);
+                        let payload = builder.use_var(payload_var);
+                        Ok((tag, payload))
+                    }
+                    None => Err(format!("undefined variable: {}", name)),
                 }
             }
 
@@ -626,7 +677,12 @@ impl Compiler {
                     }
 
                     // Variable-based function call (call_indirect)
-                    if let Some((_, payload_var)) = scope.get_var(sym) {
+                    let fn_payload_var = match scope.get_var(sym) {
+                        Some(VarSlot::Boxed(_, pv)) => Some(pv),
+                        Some(VarSlot::Unboxed(pv, _)) => Some(pv),
+                        None => None,
+                    };
+                    if let Some(payload_var) = fn_payload_var {
                         let args_exprs = &items[1..];
                         let mut call_args = Vec::new();
                         for arg_expr in args_exprs {
@@ -723,9 +779,17 @@ impl Compiler {
         }
         let name = args[0].as_symbol().map_err(|e| e.to_string())?;
         let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
-        let (tag_var, payload_var) = scope.declare_var(name, builder);
-        builder.def_var(tag_var, tag);
-        builder.def_var(payload_var, payload);
+        let ty = Self::expr_type(&args[1], scope);
+        let slot = scope.declare_typed_var(name, &ty, builder);
+        match slot {
+            VarSlot::Boxed(tag_var, payload_var) => {
+                builder.def_var(tag_var, tag);
+                builder.def_var(payload_var, payload);
+            }
+            VarSlot::Unboxed(payload_var, _) => {
+                builder.def_var(payload_var, payload);
+            }
+        }
         Ok((tag, payload))
     }
 
@@ -814,9 +878,17 @@ impl Compiler {
         for chunk in bindings.chunks(2) {
             let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
             let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
-            let (tag_var, payload_var) = scope.declare_var(name, builder);
-            builder.def_var(tag_var, tag);
-            builder.def_var(payload_var, payload);
+            let ty = Self::expr_type(&chunk[1], scope);
+            let slot = scope.declare_typed_var(name, &ty, builder);
+            match slot {
+                VarSlot::Boxed(tag_var, payload_var) => {
+                    builder.def_var(tag_var, tag);
+                    builder.def_var(payload_var, payload);
+                }
+                VarSlot::Unboxed(payload_var, _) => {
+                    builder.def_var(payload_var, payload);
+                }
+            }
         }
 
         let body = &args[1..];
