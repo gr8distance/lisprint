@@ -1,12 +1,25 @@
 #!/bin/bash
 set -e
 
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${LISPRINT_INSTALL_DIR:-/usr/local/bin}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+BINARY="$PROJECT_DIR/target/release/lisprint"
 
 echo "Building lisprint (release)..."
-cargo build --release --manifest-path "$(dirname "$0")/../Cargo.toml"
+cargo build --release --manifest-path "$PROJECT_DIR/Cargo.toml"
+
+if [ ! -f "$BINARY" ]; then
+    echo "Error: build succeeded but binary not found at $BINARY" >&2
+    exit 1
+fi
+
+if [ ! -d "$INSTALL_DIR" ]; then
+    echo "Error: install directory $INSTALL_DIR does not exist" >&2
+    exit 1
+fi
 
 echo "Installing to ${INSTALL_DIR}/lisprint..."
-cp "$(dirname "$0")/../target/release/lisprint" "${INSTALL_DIR}/lisprint"
+cp "$BINARY" "${INSTALL_DIR}/lisprint"
 
-echo "Done! $(lisprint --version)"
+echo "Done! $("${INSTALL_DIR}/lisprint" --version)"

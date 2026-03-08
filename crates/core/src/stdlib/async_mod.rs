@@ -1,9 +1,43 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::env::Env;
 use crate::eval::eval;
 use crate::value::{LispError, LispResult, NativeFnData, Value};
+
+// Global handle registries with type-safe storage
+static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+
+enum Handle {
+    Thread(std::thread::JoinHandle<LispResult>),
+    Sender(std::sync::mpsc::Sender<Value>),
+    Receiver(std::sync::mpsc::Receiver<Value>),
+}
+
+fn registry() -> &'static Mutex<HashMap<u64, Handle>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, Handle>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_handle(handle: Handle) -> u64 {
+    let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
+    registry().lock().unwrap().insert(id, handle);
+    id
+}
+
+fn store_handle_with_id(id: u64, handle: Handle) {
+    registry().lock().unwrap().insert(id, handle);
+}
+
+fn take_handle(id: u64) -> Result<Handle, LispError> {
+    registry()
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| LispError::new("invalid or already consumed handle"))
+}
 
 pub fn register(env: &mut Env) {
     reg(env, "async/sleep", async_sleep);
@@ -26,7 +60,6 @@ fn reg(env: &mut Env, name: &str, func: fn(&[Value]) -> LispResult) {
 }
 
 /// (async/sleep ms)
-/// Sleep for the given number of milliseconds (blocking)
 fn async_sleep(args: &[Value]) -> LispResult {
     if args.len() != 1 {
         return Err(LispError::new("async/sleep requires 1 argument (milliseconds)"));
@@ -53,44 +86,39 @@ fn call_fn(f: &Value) -> LispResult {
 }
 
 /// (async/spawn f)
-/// Spawn a function in a new thread, returns a future handle (map with __thread_handle__)
 fn async_spawn(args: &[Value]) -> LispResult {
     if args.len() != 1 {
         return Err(LispError::new("async/spawn requires 1 argument (function)"));
     }
     let func = args[0].clone();
-
     let handle = std::thread::spawn(move || call_fn(&func));
+    let id = store_handle(Handle::Thread(handle));
 
-    // Store the JoinHandle as a boxed pointer in a map
-    let handle_ptr = Box::into_raw(Box::new(handle)) as i64;
     let mut map = HashMap::new();
-    map.insert("__thread_handle__".to_string(), Value::Int(handle_ptr));
+    map.insert("__handle_id__".to_string(), Value::Int(id as i64));
     map.insert("type".to_string(), Value::str("future"));
     Ok(Value::Map(Arc::new(map)))
 }
 
 /// (async/await future)
-/// Wait for a spawned task to complete and return its result
 fn async_await(args: &[Value]) -> LispResult {
     if args.len() != 1 {
         return Err(LispError::new("async/await requires 1 argument (future)"));
     }
-    let future = &args[0];
-    match future {
+    match &args[0] {
         Value::Map(map) => {
-            let handle_ptr = map.get("__thread_handle__")
+            let id = map
+                .get("__handle_id__")
                 .ok_or_else(|| LispError::new("async/await: not a valid future"))?
-                .as_int()?;
+                .as_int()? as u64;
 
-            // Safety: we created this pointer in async_spawn
-            let handle = unsafe {
-                Box::from_raw(handle_ptr as *mut std::thread::JoinHandle<LispResult>)
-            };
-
-            match handle.join() {
-                Ok(result) => result,
-                Err(_) => Err(LispError::new("async/await: thread panicked")),
+            let handle = take_handle(id)?;
+            match handle {
+                Handle::Thread(jh) => match jh.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(LispError::new("async/await: thread panicked")),
+                },
+                _ => Err(LispError::new("async/await: handle is not a thread")),
             }
         }
         _ => Err(LispError::new("async/await: expected a future map")),
@@ -98,22 +126,20 @@ fn async_await(args: &[Value]) -> LispResult {
 }
 
 /// (async/channel)
-/// Create a channel, returns {:sender sender :receiver receiver}
 fn async_channel(args: &[Value]) -> LispResult {
     if !args.is_empty() {
         return Err(LispError::new("async/channel takes no arguments"));
     }
     let (tx, rx) = std::sync::mpsc::channel::<Value>();
-
-    let tx_ptr = Box::into_raw(Box::new(tx)) as i64;
-    let rx_ptr = Box::into_raw(Box::new(rx)) as i64;
+    let tx_id = store_handle(Handle::Sender(tx));
+    let rx_id = store_handle(Handle::Receiver(rx));
 
     let mut sender_map = HashMap::new();
-    sender_map.insert("__channel_sender__".to_string(), Value::Int(tx_ptr));
+    sender_map.insert("__handle_id__".to_string(), Value::Int(tx_id as i64));
     sender_map.insert("type".to_string(), Value::str("sender"));
 
     let mut receiver_map = HashMap::new();
-    receiver_map.insert("__channel_receiver__".to_string(), Value::Int(rx_ptr));
+    receiver_map.insert("__handle_id__".to_string(), Value::Int(rx_id as i64));
     receiver_map.insert("type".to_string(), Value::str("receiver"));
 
     let mut map = HashMap::new();
@@ -123,25 +149,28 @@ fn async_channel(args: &[Value]) -> LispResult {
 }
 
 /// (async/send sender value)
-/// Send a value through a channel
+/// Clone the Sender outside the lock to avoid deadlock with recv
 fn async_send(args: &[Value]) -> LispResult {
     if args.len() != 2 {
         return Err(LispError::new("async/send requires 2 arguments (sender value)"));
     }
-    let sender = &args[0];
-    match sender {
+    match &args[0] {
         Value::Map(map) => {
-            let tx_ptr = map.get("__channel_sender__")
+            let id = map
+                .get("__handle_id__")
                 .ok_or_else(|| LispError::new("async/send: not a valid sender"))?
-                .as_int()?;
+                .as_int()? as u64;
 
-            // Safety: we created this pointer in async_channel
-            // Note: we don't consume the sender, so we use a reference
-            let tx = unsafe {
-                &*(tx_ptr as *const std::sync::mpsc::Sender<Value>)
+            let tx_clone = {
+                let reg = registry().lock().unwrap();
+                match reg.get(&id) {
+                    Some(Handle::Sender(tx)) => tx.clone(),
+                    Some(_) => return Err(LispError::new("async/send: handle is not a sender")),
+                    None => return Err(LispError::new("async/send: invalid handle")),
+                }
             };
-
-            tx.send(args[1].clone())
+            tx_clone
+                .send(args[1].clone())
                 .map_err(|e| LispError::new(format!("async/send: {}", e)))?;
             Ok(Value::Nil)
         }
@@ -150,26 +179,34 @@ fn async_send(args: &[Value]) -> LispResult {
 }
 
 /// (async/recv receiver)
-/// Receive a value from a channel (blocking)
+/// Take the Receiver out of the registry to avoid holding the lock during blocking recv
 fn async_recv(args: &[Value]) -> LispResult {
     if args.len() != 1 {
         return Err(LispError::new("async/recv requires 1 argument (receiver)"));
     }
-    let receiver = &args[0];
-    match receiver {
+    match &args[0] {
         Value::Map(map) => {
-            let rx_ptr = map.get("__channel_receiver__")
+            let id = map
+                .get("__handle_id__")
                 .ok_or_else(|| LispError::new("async/recv: not a valid receiver"))?
-                .as_int()?;
+                .as_int()? as u64;
 
-            // Safety: we created this pointer in async_channel
-            let rx = unsafe {
-                &*(rx_ptr as *const std::sync::mpsc::Receiver<Value>)
-            };
-
-            match rx.recv() {
-                Ok(val) => Ok(val),
-                Err(_) => Ok(Value::Nil), // channel closed
+            let handle = take_handle(id)?;
+            match handle {
+                Handle::Receiver(rx) => {
+                    let result = match rx.recv() {
+                        Ok(val) => Ok(val),
+                        Err(_) => Ok(Value::Nil),
+                    };
+                    // Put it back for potential reuse
+                    store_handle_with_id(id, Handle::Receiver(rx));
+                    result
+                }
+                other => {
+                    // Put it back
+                    store_handle_with_id(id, other);
+                    Err(LispError::new("async/recv: handle is not a receiver"))
+                }
             }
         }
         _ => Err(LispError::new("async/recv: expected a receiver map")),

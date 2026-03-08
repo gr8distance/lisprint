@@ -84,7 +84,7 @@ fn server_start(args: &[Value]) -> LispResult {
                 eprintln!("handler error: {}", e.message);
                 let mut map = HashMap::new();
                 map.insert("status".to_string(), Value::Int(500));
-                map.insert("body".to_string(), Value::str(format!("Internal Server Error: {}", e.message)));
+                map.insert("body".to_string(), Value::str("Internal Server Error"));
                 Value::Map(Arc::new(map))
             }
         };
