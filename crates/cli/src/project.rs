@@ -384,14 +384,44 @@ pub fn build_bridge_project(proj: &Project) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&bridges_dir)
         .map_err(|e| format!("Failed to create build dir: {}", e))?;
 
-    // Extract embedded lisprint-core source
+    // 1. Compile Lisp source with Cranelift (bridge mode) → .o
+    let lisp_path = proj.entry_file().canonicalize()
+        .map_err(|e| format!("Entry file not found: {}", e))?;
+    let source = std::fs::read_to_string(&lisp_path)
+        .map_err(|e| format!("Failed to read {}: {}", lisp_path.display(), e))?;
+    let exprs = lisprint_core::parser::parse(&source)
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    eprintln!("Compiling Lisp source...");
+    let mut compiler = lisprint_compiler::Compiler::new()
+        .map_err(|e| format!("Compiler init error: {}", e))?;
+    compiler.set_bridge_mode()
+        .map_err(|e| format!("Failed to set bridge mode: {}", e))?;
+    let obj_bytes = compiler.compile_exprs(&exprs)
+        .map_err(|e| format!("Compile error: {}", e))?;
+
+    // 2. Write .o file and create static library (.a)
+    let obj_path = build_dir.join("lspcode.o");
+    std::fs::write(&obj_path, &obj_bytes)
+        .map_err(|e| format!("Failed to write object file: {}", e))?;
+
+    let ar_status = std::process::Command::new("ar")
+        .args(["rcs", "liblspcode.a", "lspcode.o"])
+        .current_dir(&build_dir)
+        .status()
+        .map_err(|e| format!("Failed to run ar: {}", e))?;
+    if !ar_status.success() {
+        return Err("Failed to create static library".to_string());
+    }
+
+    // 3. Extract embedded lisprint-core source
     let core_path = extract_embedded_core(&build_dir)?;
 
-    // 1. Generate Cargo.toml
+    // 4. Generate Cargo.toml
     let bridge_modules = proj.bridge_modules();
     generate_cargo_toml(proj, &core_path, &build_dir)?;
 
-    // 2. Copy bridge files
+    // 5. Copy bridge files
     for module in &bridge_modules {
         let src = proj.bridge_dir().join(format!("{}.rs", module));
         let dst = bridges_dir.join(format!("{}.rs", module));
@@ -399,18 +429,19 @@ pub fn build_bridge_project(proj: &Project) -> Result<PathBuf, String> {
             .map_err(|e| format!("Failed to copy bridge {}: {}", module, e))?;
     }
 
-    // 3. Generate bridges/mod.rs
+    // 6. Generate bridges/mod.rs
     generate_bridges_mod(&bridge_modules, &bridges_dir)?;
 
-    // 4. Generate main.rs
-    let lisp_path = proj.entry_file().canonicalize()
-        .map_err(|e| format!("Entry file not found: {}", e))?;
-    generate_main_rs(&lisp_path, &src_dir)?;
+    // 7. Generate build.rs (link the compiled .o static lib)
+    generate_build_rs_bridge(&build_dir)?;
 
-    // 5. Write .gitignore
+    // 8. Generate main.rs (runtime + bridge dispatch + extern _lsp_main)
+    generate_main_rs_compiled(&src_dir)?;
+
+    // 9. Write .gitignore
     let _ = std::fs::write(proj.root.join(".lisprint").join(".gitignore"), "*\n");
 
-    // 6. cargo build
+    // 10. cargo build
     eprintln!("Compiling bridges...");
     let status = std::process::Command::new("cargo")
         .args(["build", "--release"])
@@ -479,43 +510,353 @@ fn generate_bridges_mod(modules: &[String], bridges_dir: &Path) -> Result<(), St
         .map_err(|e| format!("Failed to write bridges/mod.rs: {}", e))
 }
 
-fn generate_main_rs(lisp_path: &Path, src_dir: &Path) -> Result<(), String> {
-    let content = format!(
-        r#"use lisprint_core::builtins;
+fn generate_build_rs_bridge(build_dir: &Path) -> Result<(), String> {
+    let content = r#"fn main() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!("cargo:rustc-link-search=native={}", manifest_dir);
+    println!("cargo:rustc-link-lib=static=lspcode");
+}
+"#;
+    std::fs::write(build_dir.join("build.rs"), content)
+        .map_err(|e| format!("Failed to write build.rs: {}", e))
+}
+
+fn generate_main_rs_compiled(src_dir: &Path) -> Result<(), String> {
+    let content = r##"#![allow(private_interfaces)]
+
+use lisprint_core::builtins;
 use lisprint_core::env::Env;
-use lisprint_core::eval;
-use lisprint_core::parser;
 use lisprint_core::prelude;
+use lisprint_core::value::Value;
 
 mod bridges;
 
-fn main() {{
+// === Runtime value tags ===
+const TAG_NIL: i64 = 0;
+const TAG_BOOL: i64 = 1;
+const TAG_INT: i64 = 2;
+const TAG_FLOAT: i64 = 3;
+const TAG_STR: i64 = 4;
+#[allow(dead_code)]
+const TAG_FN: i64 = 5;
+const TAG_LIST: i64 = 6;
+
+// === FFI types ===
+#[repr(C)]
+pub struct TaggedValue {
+    tag: i64,
+    payload: i64,
+}
+
+#[repr(C)]
+struct RuntimeList {
+    len: usize,
+    data: *const (i64, i64),
+}
+
+// === String helpers ===
+fn read_str(payload: i64) -> &'static str {
+    let ptr = payload as *const u8;
+    if ptr.is_null() { return ""; }
+    unsafe {
+        let mut len = 0;
+        while *ptr.add(len) != 0 { len += 1; }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        std::str::from_utf8_unchecked(slice)
+    }
+}
+
+fn leak_string(s: String) -> *const u8 {
+    let mut bytes = s.into_bytes();
+    bytes.push(0);
+    let ptr = bytes.as_ptr();
+    std::mem::forget(bytes);
+    ptr
+}
+
+// === List helpers ===
+fn make_list(items: Vec<(i64, i64)>) -> TaggedValue {
+    let len = items.len();
+    let boxed = items.into_boxed_slice();
+    let data = Box::into_raw(boxed) as *const (i64, i64);
+    let rl = Box::new(RuntimeList { len, data });
+    let ptr = Box::into_raw(rl);
+    TaggedValue { tag: TAG_LIST, payload: ptr as i64 }
+}
+
+fn get_list(payload: i64) -> &'static [(i64, i64)] {
+    let ptr = payload as *const RuntimeList;
+    if ptr.is_null() { return &[]; }
+    unsafe {
+        let rl = &*ptr;
+        std::slice::from_raw_parts(rl.data, rl.len)
+    }
+}
+
+// === Runtime functions (linked with compiled .o) ===
+
+#[no_mangle]
+pub extern "C" fn lsp_println(tag: i64, payload: i64) {
+    lsp_print(tag, payload);
+    println!();
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_print(tag: i64, payload: i64) {
+    match tag {
+        TAG_NIL => print!("nil"),
+        TAG_BOOL => print!("{}", if payload != 0 { "true" } else { "false" }),
+        TAG_INT => print!("{}", payload),
+        TAG_FLOAT => {
+            let f = f64::from_bits(payload as u64);
+            print!("{}", f);
+        }
+        TAG_STR => print!("{}", read_str(payload)),
+        TAG_LIST => {
+            let items = get_list(payload);
+            print!("(");
+            for (i, (t, p)) in items.iter().enumerate() {
+                if i > 0 { print!(" "); }
+                lsp_print(*t, *p);
+            }
+            print!(")");
+        }
+        _ => print!("<unknown:{}>", tag),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_str_concat(_tag1: i64, payload1: i64, _tag2: i64, payload2: i64) -> TaggedValue {
+    let s1 = read_str(payload1);
+    let s2 = read_str(payload2);
+    let result = format!("{}{}", s1, s2);
+    let ptr = leak_string(result);
+    TaggedValue { tag: TAG_STR, payload: ptr as i64 }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_to_string(tag: i64, payload: i64) -> TaggedValue {
+    let s = match tag {
+        TAG_NIL => "nil".to_string(),
+        TAG_BOOL => if payload != 0 { "true" } else { "false" }.to_string(),
+        TAG_INT => payload.to_string(),
+        TAG_FLOAT => f64::from_bits(payload as u64).to_string(),
+        TAG_STR => return TaggedValue { tag: TAG_STR, payload },
+        TAG_LIST => {
+            let items = get_list(payload);
+            let parts: Vec<String> = items.iter().map(|(t, p)| {
+                let tv = lsp_to_string(*t, *p);
+                read_str(tv.payload).to_string()
+            }).collect();
+            format!("({})", parts.join(" "))
+        }
+        _ => format!("<unknown:{}>", tag),
+    };
+    let ptr = leak_string(s);
+    TaggedValue { tag: TAG_STR, payload: ptr as i64 }
+}
+
+// === Data structure operations ===
+
+#[no_mangle]
+pub extern "C" fn lsp_cons(elem_tag: i64, elem_payload: i64, list_tag: i64, list_payload: i64) -> TaggedValue {
+    let mut items = vec![(elem_tag, elem_payload)];
+    if list_tag == TAG_LIST {
+        items.extend_from_slice(get_list(list_payload));
+    } else if list_tag != TAG_NIL {
+        items.push((list_tag, list_payload));
+    }
+    make_list(items)
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_first(coll_tag: i64, coll_payload: i64) -> TaggedValue {
+    if coll_tag == TAG_LIST {
+        let items = get_list(coll_payload);
+        if let Some(&(tag, payload)) = items.first() {
+            return TaggedValue { tag, payload };
+        }
+    }
+    TaggedValue { tag: TAG_NIL, payload: 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_rest(coll_tag: i64, coll_payload: i64) -> TaggedValue {
+    if coll_tag == TAG_LIST {
+        let items = get_list(coll_payload);
+        if items.len() > 1 {
+            return make_list(items[1..].to_vec());
+        }
+    }
+    make_list(vec![])
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_nth(coll_tag: i64, coll_payload: i64, _idx_tag: i64, idx_payload: i64) -> TaggedValue {
+    if coll_tag == TAG_LIST {
+        let items = get_list(coll_payload);
+        let idx = idx_payload as usize;
+        if idx < items.len() {
+            let (tag, payload) = items[idx];
+            return TaggedValue { tag, payload };
+        }
+    }
+    TaggedValue { tag: TAG_NIL, payload: 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_count(coll_tag: i64, coll_payload: i64) -> TaggedValue {
+    let len = if coll_tag == TAG_LIST {
+        get_list(coll_payload).len()
+    } else if coll_tag == TAG_NIL {
+        0
+    } else if coll_tag == TAG_STR {
+        read_str(coll_payload).len()
+    } else {
+        0
+    };
+    TaggedValue { tag: TAG_INT, payload: len as i64 }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_empty_q(coll_tag: i64, coll_payload: i64) -> TaggedValue {
+    let empty = if coll_tag == TAG_LIST {
+        get_list(coll_payload).is_empty()
+    } else if coll_tag == TAG_NIL {
+        true
+    } else {
+        false
+    };
+    TaggedValue { tag: TAG_BOOL, payload: if empty { 1 } else { 0 } }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_concat(a_tag: i64, a_payload: i64, b_tag: i64, b_payload: i64) -> TaggedValue {
+    let mut items = Vec::new();
+    if a_tag == TAG_LIST {
+        items.extend_from_slice(get_list(a_payload));
+    } else if a_tag != TAG_NIL {
+        items.push((a_tag, a_payload));
+    }
+    if b_tag == TAG_LIST {
+        items.extend_from_slice(get_list(b_payload));
+    } else if b_tag != TAG_NIL {
+        items.push((b_tag, b_payload));
+    }
+    make_list(items)
+}
+
+// === Bridge dispatch ===
+
+static mut BRIDGE_ENV: *mut Env = std::ptr::null_mut();
+
+fn tagged_to_value(tag: i64, payload: i64) -> Value {
+    match tag {
+        TAG_NIL => Value::Nil,
+        TAG_BOOL => Value::Bool(payload != 0),
+        TAG_INT => Value::Int(payload),
+        TAG_FLOAT => Value::Float(f64::from_bits(payload as u64)),
+        TAG_STR => Value::str(read_str(payload).to_string()),
+        TAG_LIST => {
+            let items = get_list(payload);
+            let values: Vec<Value> = items.iter()
+                .map(|(t, p)| tagged_to_value(*t, *p))
+                .collect();
+            Value::list(values)
+        }
+        _ => Value::Nil,
+    }
+}
+
+fn value_to_tagged(val: &Value) -> TaggedValue {
+    match val {
+        Value::Nil => TaggedValue { tag: TAG_NIL, payload: 0 },
+        Value::Bool(b) => TaggedValue { tag: TAG_BOOL, payload: if *b { 1 } else { 0 } },
+        Value::Int(n) => TaggedValue { tag: TAG_INT, payload: *n },
+        Value::Float(f) => TaggedValue { tag: TAG_FLOAT, payload: f.to_bits() as i64 },
+        Value::Str(s) => {
+            let ptr = leak_string(s.to_string());
+            TaggedValue { tag: TAG_STR, payload: ptr as i64 }
+        }
+        Value::List(items) => {
+            let pairs: Vec<(i64, i64)> = items.iter()
+                .map(|v| {
+                    let tv = value_to_tagged(v);
+                    (tv.tag, tv.payload)
+                })
+                .collect();
+            make_list(pairs)
+        }
+        _ => TaggedValue { tag: TAG_NIL, payload: 0 },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_call_bridge(name_ptr: *const u8, argc: i64, argv: *const i64) -> TaggedValue {
+    let name = unsafe {
+        let mut len = 0;
+        while *name_ptr.add(len) != 0 { len += 1; }
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(name_ptr, len))
+    };
+
+    let argc = argc as usize;
+    let mut args = Vec::with_capacity(argc);
+    for i in 0..argc {
+        let tag = unsafe { *argv.add(i * 2) };
+        let payload = unsafe { *argv.add(i * 2 + 1) };
+        args.push(tagged_to_value(tag, payload));
+    }
+
+    let env = unsafe { &*BRIDGE_ENV };
+    match env.get(name) {
+        Ok(func_val) => {
+            match &func_val {
+                Value::NativeFn(nf) => {
+                    match (nf.func)(&args) {
+                        Ok(result) => value_to_tagged(&result),
+                        Err(e) => {
+                            eprintln!("Bridge error in {}: {}", name, e);
+                            TaggedValue { tag: TAG_NIL, payload: 0 }
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("Bridge {} is not a function", name);
+                    TaggedValue { tag: TAG_NIL, payload: 0 }
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("Bridge function not found: {}", name);
+            TaggedValue { tag: TAG_NIL, payload: 0 }
+        }
+    }
+}
+
+// === Entry point ===
+
+#[repr(C)]
+struct LspResult {
+    tag: i64,
+    payload: i64,
+}
+
+extern "C" {
+    fn _lsp_main() -> LspResult;
+}
+
+fn main() {
+    // Initialize bridge environment with builtins + prelude + bridge functions
     let mut env = Env::new();
     builtins::register(&mut env);
     prelude::load(&mut env).expect("failed to load prelude");
     bridges::register_all(&mut env);
+    unsafe { BRIDGE_ENV = Box::into_raw(Box::new(env)); }
 
-    let source = std::fs::read_to_string("{lisp_path}")
-        .expect("failed to read lisp source");
-
-    match parser::parse(&source) {{
-        Ok(exprs) => {{
-            for expr in &exprs {{
-                if let Err(e) = eval::eval(expr, &mut env) {{
-                    eprintln!("Error: {{}}", e);
-                    std::process::exit(1);
-                }}
-            }}
-        }}
-        Err(e) => {{
-            eprintln!("Parse error: {{}}", e);
-            std::process::exit(1);
-        }}
-    }}
-}}
-"#,
-        lisp_path = lisp_path.display(),
-    );
+    // Run compiled Lisp code
+    unsafe { _lsp_main(); }
+}
+"##;
 
     std::fs::write(src_dir.join("main.rs"), content)
         .map_err(|e| format!("Failed to write main.rs: {}", e))

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::types;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, StackSlotData, StackSlotKind, UserFuncName};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -72,6 +72,8 @@ pub struct Compiler {
     pending_anons: Vec<(String, Vec<Value>, Vec<Value>)>,
     /// Type inference results: fn_name → (param_types, return_type)
     fn_types: HashMap<String, (Vec<LType>, LType)>,
+    /// When true, unknown function calls dispatch through lsp_call_bridge trampoline
+    bridge_mode: bool,
 }
 
 impl Compiler {
@@ -109,6 +111,7 @@ impl Compiler {
             bridges: HashMap::new(),
             pending_anons: Vec::new(),
             fn_types: HashMap::new(),
+            bridge_mode: false,
         };
         compiler.declare_bridges()?;
         Ok(compiler)
@@ -200,6 +203,22 @@ impl Compiler {
         Ok(())
     }
 
+    /// Enable bridge mode: unknown function calls dispatch through lsp_call_bridge trampoline
+    pub fn set_bridge_mode(&mut self) -> Result<(), String> {
+        self.bridge_mode = true;
+        // lsp_call_bridge(name_ptr: i64, argc: i64, argv_ptr: i64) -> (tag: i64, payload: i64)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // name_ptr
+        sig.params.push(AbiParam::new(types::I64)); // argc
+        sig.params.push(AbiParam::new(types::I64)); // argv_ptr
+        sig.returns.push(AbiParam::new(types::I64)); // return tag
+        sig.returns.push(AbiParam::new(types::I64)); // return payload
+        let id = self.module.declare_function("lsp_call_bridge", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("__bridge_call".to_string(), id);
+        Ok(())
+    }
+
     fn ensure_string(&mut self, s: &str) -> Result<DataId, String> {
         if let Some(&id) = self.strings.get(s) {
             return Ok(id);
@@ -233,6 +252,13 @@ impl Compiler {
         match expr {
             Value::Str(s) => { self.ensure_string(s)?; }
             Value::List(items) | Value::Vec(items) => {
+                // In bridge mode, collect call-position symbol names as strings
+                // (needed for bridge trampoline function name lookup)
+                if self.bridge_mode {
+                    if let Some(Value::Symbol(sym)) = items.first() {
+                        self.ensure_string(sym)?;
+                    }
+                }
                 for item in items.iter() {
                     self.collect_strings_in_expr(item)?;
                 }
@@ -631,6 +657,47 @@ impl Compiler {
                         let ret_tag = results[0];
                         let ret_payload = results[1];
                         return Ok((ret_tag, ret_payload));
+                    }
+
+                    // Bridge trampoline for unknown function calls (bridge mode only)
+                    if let Some(&bridge_call_id) = bridges.get("__bridge_call") {
+                        let args_exprs = &items[1..];
+                        let argc = args_exprs.len();
+
+                        // Evaluate all arguments
+                        let mut arg_vals = Vec::new();
+                        for arg_expr in args_exprs {
+                            let (tag, payload) = Self::emit_expr(
+                                arg_expr, builder, module, strings, functions, scope, bridges,
+                            )?;
+                            arg_vals.push((tag, payload));
+                        }
+
+                        // Get function name as string constant
+                        let name_data = strings.get(sym.as_str())
+                            .ok_or_else(|| format!("bridge name string not found: {}", sym))?;
+                        let name_gv = module.declare_data_in_func(*name_data, builder.func);
+                        let name_ptr = builder.ins().global_value(types::I64, name_gv);
+
+                        let argc_val = builder.ins().iconst(types::I64, argc as i64);
+                        let argv_ptr = if argc > 0 {
+                            let slot_size = (argc * 16) as u32;
+                            let slot = builder.create_sized_stack_slot(
+                                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3)
+                            );
+                            for (i, (tag, payload)) in arg_vals.iter().enumerate() {
+                                builder.ins().stack_store(*tag, slot, (i * 16) as i32);
+                                builder.ins().stack_store(*payload, slot, (i * 16 + 8) as i32);
+                            }
+                            builder.ins().stack_addr(types::I64, slot, 0)
+                        } else {
+                            builder.ins().iconst(types::I64, 0)
+                        };
+
+                        let local_func = module.declare_func_in_func(bridge_call_id, builder.func);
+                        let call = builder.ins().call(local_func, &[name_ptr, argc_val, argv_ptr]);
+                        let results = builder.inst_results(call);
+                        return Ok((results[0], results[1]));
                     }
                 }
 
