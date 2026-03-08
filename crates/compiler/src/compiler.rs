@@ -1432,26 +1432,33 @@ impl Compiler {
             return Err("loop bindings must have even number of elements".to_string());
         }
 
-        // Collect binding names and evaluate initial values
+        // Collect binding names, evaluate initial values, and infer types
         let mut bind_names = Vec::new();
         let mut init_tags = Vec::new();
         let mut init_payloads = Vec::new();
+        let mut bind_unboxed: Vec<Option<i64>> = Vec::new(); // per-binding: Some(tag) if unboxed
         for chunk in bindings.chunks(2) {
             let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
             bind_names.push(name.to_string());
+            let ty = Self::expr_type(&chunk[1], scope);
+            bind_unboxed.push(ltype_to_tag(&ty));
             let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
             init_tags.push(tag);
             init_payloads.push(payload);
         }
 
-        // Create loop header block with params for each binding (tag + payload)
+        // Create loop header block with params for each binding
         let loop_block = builder.create_block();
-        for _ in 0..bind_names.len() {
-            builder.append_block_param(loop_block, types::I64); // tag
-            builder.append_block_param(loop_block, types::I64); // payload
+        for ub in &bind_unboxed {
+            if ub.is_some() {
+                builder.append_block_param(loop_block, types::I64); // payload only
+            } else {
+                builder.append_block_param(loop_block, types::I64); // tag
+                builder.append_block_param(loop_block, types::I64); // payload
+            }
         }
 
-        // Create exit block with result params
+        // Create exit block with result params (always boxed — loop result type may vary)
         let exit_block = builder.create_block();
         builder.append_block_param(exit_block, types::I64); // result tag
         builder.append_block_param(exit_block, types::I64); // result payload
@@ -1459,8 +1466,12 @@ impl Compiler {
         // Jump to loop header with initial values
         let mut jump_args = Vec::new();
         for i in 0..bind_names.len() {
-            jump_args.push(init_tags[i]);
-            jump_args.push(init_payloads[i]);
+            if bind_unboxed[i].is_some() {
+                jump_args.push(init_payloads[i]); // payload only
+            } else {
+                jump_args.push(init_tags[i]);
+                jump_args.push(init_payloads[i]);
+            }
         }
         builder.ins().jump(loop_block, &jump_args);
 
@@ -1469,16 +1480,41 @@ impl Compiler {
 
         // Bind loop params to scope variables
         let block_params: Vec<cranelift_codegen::ir::Value> = builder.block_params(loop_block).to_vec();
+        let mut param_idx = 0;
         for (i, name) in bind_names.iter().enumerate() {
-            let (tag_var, payload_var) = scope.declare_var(name, builder);
-            builder.def_var(tag_var, block_params[i * 2]);
-            builder.def_var(payload_var, block_params[i * 2 + 1]);
+            if let Some(tag_const) = bind_unboxed[i] {
+                // Unboxed: single block param (payload only)
+                let ty = match tag_const {
+                    TAG_INT => LType::Int,
+                    TAG_FLOAT => LType::Float,
+                    TAG_BOOL => LType::Bool,
+                    TAG_STR => LType::Str,
+                    TAG_NIL => LType::Nil,
+                    _ => LType::Any,
+                };
+                let slot = scope.declare_typed_var(name, &ty, builder);
+                match slot {
+                    VarSlot::Unboxed(payload_var, _) => {
+                        builder.def_var(payload_var, block_params[param_idx]);
+                    }
+                    VarSlot::Boxed(_, payload_var) => {
+                        builder.def_var(payload_var, block_params[param_idx]);
+                    }
+                }
+                param_idx += 1;
+            } else {
+                // Boxed: two block params (tag + payload)
+                let (tag_var, payload_var) = scope.declare_var(name, builder);
+                builder.def_var(tag_var, block_params[param_idx]);
+                builder.def_var(payload_var, block_params[param_idx + 1]);
+                param_idx += 2;
+            }
         }
 
         let body = &args[1..];
         let (result_tag, result_payload, terminated) = Self::emit_loop_body(
             body, builder, module, strings, functions, scope, bridges,
-            loop_block, exit_block, &bind_names,
+            loop_block, exit_block, &bind_names, &bind_unboxed,
         )?;
 
         // If body didn't end with recur, jump to exit
@@ -1511,6 +1547,7 @@ impl Compiler {
         loop_block: cranelift_codegen::ir::Block,
         exit_block: cranelift_codegen::ir::Block,
         bind_names: &[String],
+        bind_unboxed: &[Option<i64>],
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value, bool), String> {
         let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
         let mut last_payload = builder.ins().iconst(types::I64, 0);
@@ -1518,7 +1555,7 @@ impl Compiler {
         for expr in exprs {
             let (tag, payload, terminated) = Self::emit_loop_expr(
                 expr, builder, module, strings, functions, scope, bridges,
-                loop_block, exit_block, bind_names,
+                loop_block, exit_block, bind_names, bind_unboxed,
             )?;
             last_tag = tag;
             last_payload = payload;
@@ -1542,6 +1579,7 @@ impl Compiler {
         loop_block: cranelift_codegen::ir::Block,
         exit_block: cranelift_codegen::ir::Block,
         bind_names: &[String],
+        bind_unboxed: &[Option<i64>],
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value, bool), String> {
         if let Value::List(items) = expr {
             if let Some(Value::Symbol(sym)) = items.first() {
@@ -1556,22 +1594,28 @@ impl Compiler {
                             ));
                         }
                         let mut jump_args = Vec::new();
-                        for arg in recur_args {
+                        let mut first_tag = None;
+                        let mut first_payload = None;
+                        for (i, arg) in recur_args.iter().enumerate() {
                             let (tag, payload) = Self::emit_expr(
                                 arg, builder, module, strings, functions, scope, bridges,
                             )?;
-                            jump_args.push(tag);
-                            jump_args.push(payload);
+                            if i == 0 { first_tag = Some(tag); first_payload = Some(payload); }
+                            if bind_unboxed[i].is_some() {
+                                jump_args.push(payload); // unboxed: payload only
+                            } else {
+                                jump_args.push(tag);
+                                jump_args.push(payload);
+                            }
                         }
                         builder.ins().jump(loop_block, &jump_args);
-                        // Block is terminated
-                        return Ok((jump_args[0], jump_args[1], true));
+                        return Ok((first_tag.unwrap(), first_payload.unwrap(), true));
                     }
                     "if" => {
                         // Special if handling inside loop to support recur in branches
                         return Self::emit_loop_if(
                             &items[1..], builder, module, strings, functions, scope, bridges,
-                            loop_block, exit_block, bind_names,
+                            loop_block, exit_block, bind_names, bind_unboxed,
                         );
                     }
                     _ => {}
@@ -1596,6 +1640,7 @@ impl Compiler {
         loop_block: cranelift_codegen::ir::Block,
         exit_block: cranelift_codegen::ir::Block,
         bind_names: &[String],
+        bind_unboxed: &[Option<i64>],
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value, bool), String> {
         if args.len() < 2 || args.len() > 3 {
             return Err("if requires 2 or 3 arguments".to_string());
@@ -1627,7 +1672,7 @@ impl Compiler {
         builder.seal_block(then_block);
         let (then_tag, then_payload, then_terminated) = Self::emit_loop_expr(
             &args[1], builder, module, strings, functions, scope, bridges,
-            loop_block, exit_block, bind_names,
+            loop_block, exit_block, bind_names, bind_unboxed,
         )?;
         if !then_terminated {
             builder.ins().jump(merge_block, &[then_tag, then_payload]);
@@ -1639,7 +1684,7 @@ impl Compiler {
         let (else_tag, else_payload, else_terminated) = if args.len() == 3 {
             Self::emit_loop_expr(
                 &args[2], builder, module, strings, functions, scope, bridges,
-                loop_block, exit_block, bind_names,
+                loop_block, exit_block, bind_names, bind_unboxed,
             )?
         } else {
             let t = builder.ins().iconst(types::I64, TAG_NIL);
