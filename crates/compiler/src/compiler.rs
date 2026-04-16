@@ -2088,6 +2088,30 @@ impl Compiler {
     fn expand_expr(expr: &Value, env: &mut Env) -> Result<Value, String> {
         match expr {
             Value::List(items) if !items.is_empty() => {
+                // Expand pipe operator: (|> init form1 form2 ...) → nested calls
+                if let Value::Symbol(sym) = &items[0] {
+                    if sym.as_str() == "|>" && items.len() >= 2 {
+                        let mut acc = Self::expand_expr(&items[1], env)?;
+                        for form in &items[2..] {
+                            let expanded_form = Self::expand_expr(form, env)?;
+                            acc = match &expanded_form {
+                                Value::List(call_items) if !call_items.is_empty() => {
+                                    // (f arg1 arg2) → (f acc arg1 arg2)
+                                    let mut new_call = vec![call_items[0].clone(), acc];
+                                    new_call.extend(call_items[1..].iter().cloned());
+                                    Value::list(new_call)
+                                }
+                                Value::Symbol(_) => {
+                                    // f → (f acc)
+                                    Value::list(vec![expanded_form, acc])
+                                }
+                                _ => return Err(format!("|>: invalid form: {}", expanded_form)),
+                            };
+                        }
+                        return Ok(acc);
+                    }
+                }
+
                 // Check if head is a macro
                 if let Value::Symbol(sym) = &items[0] {
                     if let Ok(val) = env.get(sym) {
@@ -2678,6 +2702,27 @@ mod tests {
     fn test_compile_deftest_skipped() {
         // deftest should be skipped in compiled output
         let exprs = parse("(defun f (x) x) (deftest my-test (assert= 1 1)) (f 42)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_pipe_basic() {
+        let exprs = parse("(|> 5 (+ 1) (* 2))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_pipe_with_defun() {
+        let exprs = parse("(defun double (x) (* x 2)) (|> 5 (+ 1) double)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_pipe_list_ops() {
+        let exprs = parse("(|> (list 1 2 3) first (+ 10))").unwrap();
         let result = Compiler::new().unwrap().compile_exprs(&exprs);
         assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
     }

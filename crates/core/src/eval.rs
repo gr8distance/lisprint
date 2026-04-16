@@ -71,6 +71,7 @@ fn eval_list(items: &[Value], env: &mut Env) -> LispResult {
             "deftype" => return eval_deftype(&items[1..], env),
             "deftrait" => return eval_deftrait(&items[1..], env),
             "defimpl" => return eval_defimpl(&items[1..], env),
+            "|>" => return eval_pipe(&items[1..], env),
             _ => {
                 // .field アクセス: (.field obj)
                 if name.starts_with('.') && name.len() > 1 {
@@ -851,6 +852,38 @@ fn eval_defimpl(args: &[Value], env: &mut Env) -> LispResult {
 }
 
 /// (match value pattern1 expr1 pattern2 expr2 ...)
+/// (|> init form1 form2 ...) — パイプ演算子
+/// 前の結果を次のフォームの第1引数に挿入する
+/// フォームがシンボルなら (sym prev) として呼び出す
+/// フォームがリストなら (fn prev args...) として呼び出す
+/// フォームが .field なら (.field prev) として呼び出す
+fn eval_pipe(args: &[Value], env: &mut Env) -> LispResult {
+    if args.is_empty() {
+        return Err(LispError::new("|> requires at least an initial value"));
+    }
+
+    let mut acc = eval(&args[0], env)?;
+
+    for form in &args[1..] {
+        acc = match form {
+            // (f arg1 arg2 ...) → (f acc arg1 arg2 ...)
+            Value::List(items) if !items.is_empty() => {
+                let mut new_call = vec![items[0].clone()];
+                new_call.push(quote_value(acc));
+                new_call.extend(items[1..].iter().cloned());
+                eval(&Value::list(new_call), env)?
+            }
+            // f → (f acc)
+            Value::Symbol(_) => {
+                eval(&Value::list(vec![form.clone(), quote_value(acc)]), env)?
+            }
+            _ => return Err(LispError::new(format!("|>: invalid form: {}", form))),
+        };
+    }
+
+    Ok(acc)
+}
+
 fn eval_match(args: &[Value], env: &mut Env) -> LispResult {
     if args.len() < 3 || args.len() % 2 != 1 {
         return Err(LispError::new("match requires a value and pattern/expr pairs"));
@@ -2048,5 +2081,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(result.unwrap(), Value::Int(33));
+    }
+
+    // --- Pipe operator tests ---
+
+    #[test]
+    fn test_pipe_basic() {
+        // (|> 5 (+ 1) (* 2)) => (* (+ 5 1) 2) => 12
+        assert_eq!(eval_str("(|> 5 (+ 1) (* 2))").unwrap(), Value::Int(12));
+    }
+
+    #[test]
+    fn test_pipe_symbol() {
+        // (|> -5 (+ 10)) => 5
+        assert_eq!(eval_str("(|> -5 (+ 10))").unwrap(), Value::Int(5));
+    }
+
+    #[test]
+    fn test_pipe_with_fn() {
+        // (|> 10 (+ 1) (+ 1) (+ 1)) => 13
+        assert_eq!(eval_str("(|> 10 (+ 1) (+ 1) (+ 1))").unwrap(), Value::Int(13));
+    }
+
+    #[test]
+    fn test_pipe_with_list_ops() {
+        // (|> (list 1 2 3) first) => 1
+        assert_eq!(eval_str("(|> (list 1 2 3) first)").unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn test_pipe_dot_access() {
+        // (|> (Point 10 20) (.x))
+        assert_eq!(
+            eval_str("(deftype Point (x y)) (|> (Point 10 20) (.x))").unwrap(),
+            Value::Int(10)
+        );
     }
 }
