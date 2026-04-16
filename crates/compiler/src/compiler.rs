@@ -21,6 +21,7 @@ pub const TAG_INT: i64 = 2;
 pub const TAG_FLOAT: i64 = 3;
 pub const TAG_STR: i64 = 4;
 pub const TAG_LIST: i64 = 5;
+pub const TAG_FN: i64 = 6;
 
 use cranelift_codegen::ir::Block;
 
@@ -58,6 +59,18 @@ impl FnScope {
     }
 }
 
+/// Info about a lambda function collected during the pre-pass.
+struct LambdaInfo {
+    /// Unique name for this lambda
+    name: String,
+    /// Parameter names
+    params: Vec<String>,
+    /// Body expressions
+    body: Vec<Value>,
+    /// Captured variable names (free variables from enclosing scope)
+    captures: Vec<String>,
+}
+
 /// Cranelift-based compiler for lisprint
 pub struct Compiler {
     module: ObjectModule,
@@ -70,6 +83,10 @@ pub struct Compiler {
     next_func_idx: u32,
     /// Bridge (runtime) functions: name → FuncId
     bridges: HashMap<String, FuncId>,
+    /// Lambda functions: name → (FuncId, param_count, capture_count)
+    lambdas: HashMap<String, (FuncId, usize, usize)>,
+    #[allow(dead_code)]
+    next_lambda_id: usize,
 }
 
 impl Compiler {
@@ -105,6 +122,8 @@ impl Compiler {
             functions: HashMap::new(),
             next_func_idx: 1,
             bridges: HashMap::new(),
+            lambdas: HashMap::new(),
+            next_lambda_id: 0,
         };
         compiler.declare_bridges()?;
         Ok(compiler)
@@ -148,6 +167,36 @@ impl Compiler {
         let id = self.module.declare_function("lsp_to_string", Linkage::Import, &sig_tostr)
             .map_err(|e| e.to_string())?;
         self.bridges.insert("to-string".to_string(), id);
+
+        // --- Error handling ---
+        // lsp_throw(tag, payload) -> void (sets global error)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_throw", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("throw".to_string(), id);
+
+        // lsp_has_error() -> i64 (1 if error, 0 if not)
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_has_error", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("has_error".to_string(), id);
+
+        // lsp_get_error() -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_get_error", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("get_error".to_string(), id);
+
+        // lsp_clear_error() -> void
+        let sig = self.module.make_signature();
+        let id = self.module.declare_function("lsp_clear_error", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("clear_error".to_string(), id);
 
         // --- List operations ---
         // All list bridge functions: (tag, payload)* -> (tag, payload)
@@ -389,6 +438,86 @@ impl Compiler {
                     &self.functions,
                     &mut scope,
                     &self.bridges,
+                    &self.lambdas,
+                )?;
+                last_tag = tag;
+                last_payload = payload;
+            }
+
+            builder.ins().return_(&[last_tag, last_payload]);
+            builder.finalize();
+        }
+
+        self.module.define_function(func_id, &mut self.ctx).map_err(|e| e.to_string())?;
+        self.module.clear_context(&mut self.ctx);
+        Ok(())
+    }
+
+    /// Compile a lambda function. Signature: (env_ptr, params...) → (tag, payload)
+    fn compile_lambda(&mut self, info: &LambdaInfo) -> Result<(), String> {
+        let (func_id, _, _) = *self.lambdas.get(&info.name)
+            .ok_or_else(|| format!("lambda {} not declared", info.name))?;
+
+        let param_count = info.params.len();
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // env_ptr
+        for _ in 0..param_count {
+            sig.params.push(AbiParam::new(types::I64)); // tag
+            sig.params.push(AbiParam::new(types::I64)); // payload
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+
+        self.ctx.func.signature = sig;
+        self.ctx.func.name = UserFuncName::user(0, self.next_func_idx);
+        self.next_func_idx += 1;
+
+        {
+            let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.func_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            builder.seal_block(entry_block);
+
+            let mut scope = FnScope::new();
+
+            // First param is env_ptr (closure captures)
+            let env_ptr = builder.block_params(entry_block)[0];
+
+            // Load captured variables from env_ptr
+            // Layout: [cap0_tag, cap0_payload, cap1_tag, cap1_payload, ...]
+            for (i, cap_name) in info.captures.iter().enumerate() {
+                let (tag_var, payload_var) = scope.declare_var(cap_name, &mut builder);
+                let offset_tag = (i * 2 * 8) as i32;
+                let offset_payload = (i * 2 * 8 + 8) as i32;
+                let tag_val = builder.ins().load(types::I64, cranelift_codegen::ir::MemFlags::new(), env_ptr, offset_tag);
+                let payload_val = builder.ins().load(types::I64, cranelift_codegen::ir::MemFlags::new(), env_ptr, offset_payload);
+                builder.def_var(tag_var, tag_val);
+                builder.def_var(payload_var, payload_val);
+            }
+
+            // Bind regular parameters (offset by 1 for env_ptr)
+            for (i, param_name) in info.params.iter().enumerate() {
+                let (tag_var, payload_var) = scope.declare_var(param_name, &mut builder);
+                let tag_val = builder.block_params(entry_block)[1 + i * 2];
+                let payload_val = builder.block_params(entry_block)[1 + i * 2 + 1];
+                builder.def_var(tag_var, tag_val);
+                builder.def_var(payload_var, payload_val);
+            }
+
+            // Compile body
+            let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+            let mut last_payload = builder.ins().iconst(types::I64, 0);
+            for expr in &info.body {
+                let (tag, payload) = Self::emit_expr(
+                    expr,
+                    &mut builder,
+                    &mut self.module,
+                    &self.strings,
+                    &self.functions,
+                    &mut scope,
+                    &self.bridges,
+                    &self.lambdas,
                 )?;
                 last_tag = tag;
                 last_payload = payload;
@@ -412,6 +541,7 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         match expr {
             // Literals
@@ -467,23 +597,29 @@ impl Compiler {
                 // Check for special forms
                 if let Value::Symbol(sym) = &items[0] {
                     match sym.as_str() {
-                        "def" => return Self::emit_def(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "do" => return Self::emit_do(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "if" => return Self::emit_if(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "let" => return Self::emit_let(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "def" => return Self::emit_def(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "do" => return Self::emit_do(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "if" => return Self::emit_if(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "let" => return Self::emit_let(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
                         "+" | "-" | "*" | "/" | "%" =>
-                            return Self::emit_arith(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
+                            return Self::emit_arith(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges, lambdas),
                         "=" | "<" | ">" | "<=" | ">=" | "!=" =>
-                            return Self::emit_cmp(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
-                        "not" => return Self::emit_not(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "loop" => return Self::emit_loop(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "recur" => return Self::emit_recur(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "list" => return Self::emit_list_literal(&items[1..], builder, module, strings, functions, scope, bridges),
-                        "println" | "print" => return Self::emit_bridge_io(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
+                            return Self::emit_cmp(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "not" => return Self::emit_not(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "loop" => return Self::emit_loop(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "recur" => return Self::emit_recur(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "list" => return Self::emit_list_literal(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "match" => return Self::emit_match(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "throw" => return Self::emit_throw(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "try" => return Self::emit_try(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
+                        "println" | "print" => return Self::emit_bridge_io(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges, lambdas),
                         "defun" => {
                             let tag = builder.ins().iconst(types::I64, TAG_NIL);
                             let payload = builder.ins().iconst(types::I64, 0);
                             return Ok((tag, payload));
+                        }
+                        "__make_closure" => {
+                            return Self::emit_make_closure(&items[1..], builder, module, scope, lambdas);
                         }
                         _ => {}
                     }
@@ -504,7 +640,7 @@ impl Compiler {
                         let mut call_args = Vec::new();
                         for arg_expr in args_exprs {
                             let (tag, payload) = Self::emit_expr(
-                                arg_expr, builder, module, strings, functions, scope, bridges,
+                                arg_expr, builder, module, strings, functions, scope, bridges, lambdas,
                             )?;
                             call_args.push(tag);
                             call_args.push(payload);
@@ -520,7 +656,12 @@ impl Compiler {
 
                     // Bridge call fallback (builtins: cons, first, rest, count, nth, empty?, concat, str)
                     if bridges.contains_key(sym.as_str()) {
-                        return Self::emit_bridge_call(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges);
+                        return Self::emit_bridge_call(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges, lambdas);
+                    }
+
+                    // Closure call: variable holding a function value
+                    if scope.get_var(sym).is_some() {
+                        return Self::emit_closure_call(sym, &items[1..], builder, module, strings, functions, scope, bridges, lambdas);
                     }
                 }
 
@@ -540,12 +681,13 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 2 {
             return Err("def requires 2 arguments (name value)".to_string());
         }
         let name = args[0].as_symbol().map_err(|e| e.to_string())?;
-        let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+        let (tag, payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges, lambdas)?;
         let (tag_var, payload_var) = scope.declare_var(name, builder);
         builder.def_var(tag_var, tag);
         builder.def_var(payload_var, payload);
@@ -561,12 +703,13 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() < 2 || args.len() > 3 {
             return Err("if requires 2 or 3 arguments".to_string());
         }
 
-        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
 
         // Truthy: not nil (tag!=0) and not false (tag==1 && payload==0)
         // Falsy: nil (tag==0) OR (tag==1 AND payload==0)
@@ -588,14 +731,14 @@ impl Compiler {
         // Then branch
         builder.switch_to_block(then_block);
         builder.seal_block(then_block);
-        let (then_tag, then_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+        let (then_tag, then_payload) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges, lambdas)?;
         builder.ins().jump(merge_block, &[then_tag, then_payload]);
 
         // Else branch
         builder.switch_to_block(else_block);
         builder.seal_block(else_block);
         let (else_tag, else_payload) = if args.len() == 3 {
-            Self::emit_expr(&args[2], builder, module, strings, functions, scope, bridges)?
+            Self::emit_expr(&args[2], builder, module, strings, functions, scope, bridges, lambdas)?
         } else {
             let t = builder.ins().iconst(types::I64, TAG_NIL);
             let p = builder.ins().iconst(types::I64, 0);
@@ -620,6 +763,7 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.is_empty() {
             return Err("let requires bindings and body".to_string());
@@ -635,25 +779,83 @@ impl Compiler {
         }
 
         for chunk in bindings.chunks(2) {
-            let name = chunk[0].as_symbol().map_err(|e| e.to_string())?;
-            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
-            let (tag_var, payload_var) = scope.declare_var(name, builder);
-            builder.def_var(tag_var, tag);
-            builder.def_var(payload_var, payload);
+            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges, lambdas)?;
+            Self::emit_destructure_bind(&chunk[0], tag, payload, builder, module, scope, bridges, lambdas)?;
         }
 
         let body = &args[1..];
         let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
         let mut last_payload = builder.ins().iconst(types::I64, 0);
         for expr in body {
-            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges, lambdas)?;
             last_tag = tag;
             last_payload = payload;
         }
         Ok((last_tag, last_payload))
     }
 
-    /// Arithmetic: +, -, *, /, %
+    /// Bind a destructuring pattern to a compiled value (tag, payload).
+    fn emit_destructure_bind(
+        pattern: &Value,
+        val_tag: cranelift_codegen::ir::Value,
+        val_payload: cranelift_codegen::ir::Value,
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        #[allow(unused)] lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(), String> {
+        match pattern {
+            // Simple symbol binding
+            Value::Symbol(name) => {
+                let (tag_var, payload_var) = scope.declare_var(name, builder);
+                builder.def_var(tag_var, val_tag);
+                builder.def_var(payload_var, val_payload);
+                Ok(())
+            }
+            // Vector destructuring: [a b c]
+            Value::Vec(items) => {
+                let nth_id = bridges.get("nth")
+                    .ok_or_else(|| "bridge function nth not found".to_string())?;
+                for (i, item) in items.iter().enumerate() {
+                    let idx_tag = builder.ins().iconst(types::I64, TAG_INT);
+                    let idx_payload = builder.ins().iconst(types::I64, i as i64);
+                    let local_func = module.declare_func_in_func(*nth_id, builder.func);
+                    let call = builder.ins().call(local_func, &[val_tag, val_payload, idx_tag, idx_payload]);
+                    let results = builder.inst_results(call);
+                    let elem_tag = results[0];
+                    let elem_payload = results[1];
+                    // Recursively bind (supports nested destructuring)
+                    Self::emit_destructure_bind(item, elem_tag, elem_payload, builder, module, scope, bridges, lambdas)?;
+                }
+                Ok(())
+            }
+            // Map destructuring: {:keys [x y]} — keys style
+            Value::Map(map) => {
+                // For now, support {:keys [sym1 sym2 ...]} pattern
+                // Keys are looked up by name from the map
+                if let Some(Value::Vec(keys)) = map.get("keys") {
+                    // :keys pattern — each key name is used to look up from the map
+                    // We use the same nth approach but this needs map bridge support
+                    // For now, just bind each key as a variable with nil (placeholder)
+                    for key in keys.iter() {
+                        if let Value::Symbol(name) = key {
+                            let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+                            let nil_payload = builder.ins().iconst(types::I64, 0);
+                            let (tag_var, payload_var) = scope.declare_var(name, builder);
+                            builder.def_var(tag_var, nil_tag);
+                            builder.def_var(payload_var, nil_payload);
+                        }
+                    }
+                }
+                // TODO: full map destructuring with runtime bridge
+                Ok(())
+            }
+            _ => Err(format!("invalid destructuring pattern: {}", pattern)),
+        }
+    }
+
+    /// Arithmetic: +, -, *, /, % — supports 2+ arguments via left fold
     fn emit_arith(
         op: &str,
         args: &[Value],
@@ -663,24 +865,27 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
-        if args.len() != 2 {
-            return Err(format!("{} requires 2 arguments", op));
+        if args.len() < 2 {
+            return Err(format!("{} requires at least 2 arguments", op));
         }
-        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
-        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+        let (_, mut acc) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
 
-        let result = match op {
-            "+" => builder.ins().iadd(lhs, rhs),
-            "-" => builder.ins().isub(lhs, rhs),
-            "*" => builder.ins().imul(lhs, rhs),
-            "/" => builder.ins().sdiv(lhs, rhs),
-            "%" => builder.ins().srem(lhs, rhs),
-            _ => unreachable!(),
-        };
+        for arg in &args[1..] {
+            let (_, rhs) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges, lambdas)?;
+            acc = match op {
+                "+" => builder.ins().iadd(acc, rhs),
+                "-" => builder.ins().isub(acc, rhs),
+                "*" => builder.ins().imul(acc, rhs),
+                "/" => builder.ins().sdiv(acc, rhs),
+                "%" => builder.ins().srem(acc, rhs),
+                _ => unreachable!(),
+            };
+        }
 
         let tag = builder.ins().iconst(types::I64, TAG_INT);
-        Ok((tag, result))
+        Ok((tag, acc))
     }
 
     /// Comparison: =, <, >, <=, >=, !=
@@ -693,12 +898,13 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 2 {
             return Err(format!("{} requires 2 arguments", op));
         }
-        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
-        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges)?;
+        let (_, lhs) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
+        let (_, rhs) = Self::emit_expr(&args[1], builder, module, strings, functions, scope, bridges, lambdas)?;
 
         use cranelift_codegen::ir::condcodes::IntCC;
         let cc = match op {
@@ -726,11 +932,12 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 1 {
             return Err("not requires 1 argument".to_string());
         }
-        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let (cond_tag, cond_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
 
         // Falsy = nil or false
         let is_nil = builder.ins().icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, cond_tag, TAG_NIL);
@@ -744,6 +951,399 @@ impl Compiler {
     }
 
     /// (println expr) / (print expr) — bridge call to runtime
+    /// (throw value) — set global error state
+    fn emit_throw(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.is_empty() {
+            return Err("throw requires 1 argument".to_string());
+        }
+        let (tag, payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
+        let throw_id = bridges.get("throw")
+            .ok_or_else(|| "bridge function throw not found".to_string())?;
+        let local_func = module.declare_func_in_func(*throw_id, builder.func);
+        builder.ins().call(local_func, &[tag, payload]);
+
+        let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let nil_payload = builder.ins().iconst(types::I64, 0);
+        Ok((nil_tag, nil_payload))
+    }
+
+    /// (try body (catch e handler))
+    fn emit_try(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        // (try body (catch e handler))
+        // Find the catch clause
+        let mut body_exprs = Vec::new();
+        let mut catch_var = None;
+        let mut catch_body = None;
+
+        for arg in args {
+            if let Value::List(items) = arg {
+                if items.len() >= 3 {
+                    if let Value::Symbol(sym) = &items[0] {
+                        if sym.as_str() == "catch" {
+                            if let Value::Symbol(var_name) = &items[1] {
+                                catch_var = Some(var_name.to_string());
+                                catch_body = Some(items[2..].to_vec());
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            body_exprs.push(arg);
+        }
+
+        let catch_var = catch_var.ok_or_else(|| "try requires a catch clause".to_string())?;
+        let catch_body = catch_body.ok_or_else(|| "try requires a catch body".to_string())?;
+
+        // Clear any existing error
+        let clear_id = bridges.get("clear_error")
+            .ok_or_else(|| "bridge function clear_error not found".to_string())?;
+        let clear_func = module.declare_func_in_func(*clear_id, builder.func);
+        builder.ins().call(clear_func, &[]);
+
+        // Compile body
+        let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let mut last_payload = builder.ins().iconst(types::I64, 0);
+        for expr in &body_exprs {
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges, lambdas)?;
+            last_tag = tag;
+            last_payload = payload;
+        }
+
+        // Check if error occurred
+        let has_err_id = bridges.get("has_error")
+            .ok_or_else(|| "bridge function has_error not found".to_string())?;
+        let has_err_func = module.declare_func_in_func(*has_err_id, builder.func);
+        let has_err_call = builder.ins().call(has_err_func, &[]);
+        let has_err = builder.inst_results(has_err_call)[0];
+        let is_err = builder.ins().icmp_imm(
+            cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+            has_err, 0,
+        );
+
+        let catch_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, types::I64);
+        builder.append_block_param(merge_block, types::I64);
+
+        builder.ins().brif(is_err, catch_block, &[], merge_block, &[last_tag, last_payload]);
+
+        // Catch block
+        builder.switch_to_block(catch_block);
+        builder.seal_block(catch_block);
+
+        // Get error value and bind to catch variable
+        let get_err_id = bridges.get("get_error")
+            .ok_or_else(|| "bridge function get_error not found".to_string())?;
+        let get_err_func = module.declare_func_in_func(*get_err_id, builder.func);
+        let get_err_call = builder.ins().call(get_err_func, &[]);
+        let err_results = builder.inst_results(get_err_call);
+        let err_tag = err_results[0];
+        let err_payload = err_results[1];
+
+        let (err_tag_var, err_payload_var) = scope.declare_var(&catch_var, builder);
+        builder.def_var(err_tag_var, err_tag);
+        builder.def_var(err_payload_var, err_payload);
+
+        // Clear error
+        let clear_func2 = module.declare_func_in_func(*clear_id, builder.func);
+        builder.ins().call(clear_func2, &[]);
+
+        // Compile catch body
+        let mut catch_last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let mut catch_last_payload = builder.ins().iconst(types::I64, 0);
+        for expr in &catch_body {
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges, lambdas)?;
+            catch_last_tag = tag;
+            catch_last_payload = payload;
+        }
+        builder.ins().jump(merge_block, &[catch_last_tag, catch_last_payload]);
+
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        let result_tag = builder.block_params(merge_block)[0];
+        let result_payload = builder.block_params(merge_block)[1];
+        Ok((result_tag, result_payload))
+    }
+
+    /// (match value pattern1 expr1 pattern2 expr2 ...)
+    /// Compiles to a chain of if-else blocks checking each pattern.
+    fn emit_match(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() < 3 || args.len() % 2 != 1 {
+            return Err("match requires a value and pattern/expr pairs".to_string());
+        }
+
+        // Evaluate target
+        let (target_tag, target_payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
+
+        // Create merge block for the final result
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, types::I64);
+        builder.append_block_param(merge_block, types::I64);
+
+        let pairs = &args[1..];
+        let num_pairs = pairs.len() / 2;
+
+        for (i, chunk) in pairs.chunks(2).enumerate() {
+            let pattern = &chunk[0];
+            let body = &chunk[1];
+            let is_last = i == num_pairs - 1;
+
+            match pattern {
+                // Wildcard _ or symbol binding — always matches
+                Value::Symbol(s) if s.as_str() == "_" => {
+                    // Wildcard: just compile the body
+                    let (tag, payload) = Self::emit_expr(body, builder, module, strings, functions, scope, bridges, lambdas)?;
+                    builder.ins().jump(merge_block, &[tag, payload]);
+                    // No more patterns after wildcard
+                    break;
+                }
+                Value::Symbol(s) => {
+                    // Binding: bind target to variable, compile body
+                    let (tag_var, payload_var) = scope.declare_var(s, builder);
+                    builder.def_var(tag_var, target_tag);
+                    builder.def_var(payload_var, target_payload);
+                    let (tag, payload) = Self::emit_expr(body, builder, module, strings, functions, scope, bridges, lambdas)?;
+                    builder.ins().jump(merge_block, &[tag, payload]);
+                    break;
+                }
+
+                // Literal patterns: nil, bool, int
+                Value::Nil => {
+                    let is_nil = builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        target_tag, TAG_NIL,
+                    );
+                    let then_block = builder.create_block();
+                    let else_block = builder.create_block();
+                    builder.ins().brif(is_nil, then_block, &[], else_block, &[]);
+
+                    builder.switch_to_block(then_block);
+                    builder.seal_block(then_block);
+                    let (tag, payload) = Self::emit_expr(body, builder, module, strings, functions, scope, bridges, lambdas)?;
+                    builder.ins().jump(merge_block, &[tag, payload]);
+
+                    builder.switch_to_block(else_block);
+                    builder.seal_block(else_block);
+                    if is_last {
+                        // No match — return nil
+                        let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+                        let nil_payload = builder.ins().iconst(types::I64, 0);
+                        builder.ins().jump(merge_block, &[nil_tag, nil_payload]);
+                    }
+                }
+                Value::Bool(b) => {
+                    let is_bool = builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        target_tag, TAG_BOOL,
+                    );
+                    let expected = if *b { 1i64 } else { 0i64 };
+                    let is_val = builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        target_payload, expected,
+                    );
+                    let is_match = builder.ins().band(is_bool, is_val);
+
+                    let then_block = builder.create_block();
+                    let else_block = builder.create_block();
+                    builder.ins().brif(is_match, then_block, &[], else_block, &[]);
+
+                    builder.switch_to_block(then_block);
+                    builder.seal_block(then_block);
+                    let (tag, payload) = Self::emit_expr(body, builder, module, strings, functions, scope, bridges, lambdas)?;
+                    builder.ins().jump(merge_block, &[tag, payload]);
+
+                    builder.switch_to_block(else_block);
+                    builder.seal_block(else_block);
+                    if is_last {
+                        let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+                        let nil_payload = builder.ins().iconst(types::I64, 0);
+                        builder.ins().jump(merge_block, &[nil_tag, nil_payload]);
+                    }
+                }
+                Value::Int(n) => {
+                    let is_int = builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        target_tag, TAG_INT,
+                    );
+                    let is_val = builder.ins().icmp_imm(
+                        cranelift_codegen::ir::condcodes::IntCC::Equal,
+                        target_payload, *n,
+                    );
+                    let is_match = builder.ins().band(is_int, is_val);
+
+                    let then_block = builder.create_block();
+                    let else_block = builder.create_block();
+                    builder.ins().brif(is_match, then_block, &[], else_block, &[]);
+
+                    builder.switch_to_block(then_block);
+                    builder.seal_block(then_block);
+                    let (tag, payload) = Self::emit_expr(body, builder, module, strings, functions, scope, bridges, lambdas)?;
+                    builder.ins().jump(merge_block, &[tag, payload]);
+
+                    builder.switch_to_block(else_block);
+                    builder.seal_block(else_block);
+                    if is_last {
+                        let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+                        let nil_payload = builder.ins().iconst(types::I64, 0);
+                        builder.ins().jump(merge_block, &[nil_tag, nil_payload]);
+                    }
+                }
+
+                _ => {
+                    // Unsupported pattern — skip (treat as no match for now)
+                    if is_last {
+                        let nil_tag = builder.ins().iconst(types::I64, TAG_NIL);
+                        let nil_payload = builder.ins().iconst(types::I64, 0);
+                        builder.ins().jump(merge_block, &[nil_tag, nil_payload]);
+                    }
+                }
+            }
+        }
+
+        builder.seal_block(merge_block);
+        builder.switch_to_block(merge_block);
+        let result_tag = builder.block_params(merge_block)[0];
+        let result_payload = builder.block_params(merge_block)[1];
+        Ok((result_tag, result_payload))
+    }
+
+    /// (__make_closure "lambda_name" cap1 cap2 ...) — create a closure struct on heap
+    /// Closure layout: [func_ptr: i64, cap0_tag, cap0_payload, cap1_tag, cap1_payload, ...]
+    fn emit_make_closure(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        scope: &mut FnScope,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.is_empty() {
+            return Err("__make_closure requires lambda name".to_string());
+        }
+        let lambda_name = args[0].as_str().map_err(|e| e.to_string())?;
+        let (func_id, _, _) = *lambdas.get(lambda_name)
+            .ok_or_else(|| format!("lambda {} not found", lambda_name))?;
+
+        let captures = &args[1..]; // captured variable symbols
+        let capture_count = captures.len();
+
+        // Allocate closure struct on heap via stack slot + runtime
+        // Layout: [func_ptr, cap0_tag, cap0_payload, ...]
+        let struct_size = (1 + capture_count * 2) * 8;
+        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            struct_size as u32,
+            0,
+        ));
+
+        // Store func_ptr
+        let func_ref = module.declare_func_in_func(func_id, builder.func);
+        let func_ptr = builder.ins().func_addr(types::I64, func_ref);
+        builder.ins().stack_store(func_ptr, slot, 0);
+
+        // Store captured values
+        for (i, cap) in captures.iter().enumerate() {
+            let cap_name = cap.as_symbol().map_err(|e| e.to_string())?;
+            let (tag_var, payload_var) = scope.get_var(cap_name)
+                .ok_or_else(|| format!("capture variable {} not found", cap_name))?;
+            let tag_val = builder.use_var(tag_var);
+            let payload_val = builder.use_var(payload_var);
+            let offset_tag = ((1 + i * 2) * 8) as i32;
+            let offset_payload = ((1 + i * 2 + 1) * 8) as i32;
+            builder.ins().stack_store(tag_val, slot, offset_tag);
+            builder.ins().stack_store(payload_val, slot, offset_payload);
+        }
+
+        // Get pointer to the closure struct
+        // NOTE: This points to the stack slot, which is only valid within this function frame.
+        // For closures that escape, we'd need heap allocation. For now, use runtime bridge.
+        let closure_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+
+        // Heap-allocate via lsp_closure_alloc bridge (copy stack data to heap)
+        // For simplicity, we'll just return the stack addr — closures passed as args
+        // to functions called in the same frame will work. For escaping closures,
+        // a heap allocation bridge would be needed.
+
+        let tag = builder.ins().iconst(types::I64, TAG_FN);
+        Ok((tag, closure_ptr))
+    }
+
+    /// Call a closure: evaluate the callee variable, extract func_ptr and env_ptr,
+    /// then do an indirect call.
+    fn emit_closure_call(
+        callee_name: &str,
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        let (tag_var, payload_var) = scope.get_var(callee_name)
+            .ok_or_else(|| format!("undefined variable: {}", callee_name))?;
+        let closure_ptr = builder.use_var(payload_var);
+        let _ = builder.use_var(tag_var); // TAG_FN, we trust it
+
+        // Load func_ptr from closure struct offset 0
+        let func_ptr = builder.ins().load(types::I64, cranelift_codegen::ir::MemFlags::new(), closure_ptr, 0);
+
+        // env_ptr = closure_ptr + 8 (start of captures)
+        let env_ptr = builder.ins().iadd_imm(closure_ptr, 8);
+
+        // Build call args: (env_ptr, arg0_tag, arg0_payload, ...)
+        let mut call_args = vec![env_ptr];
+        for arg in args {
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges, lambdas)?;
+            call_args.push(tag);
+            call_args.push(payload);
+        }
+
+        // Build signature for indirect call: (env_ptr, N * (tag, payload)) → (tag, payload)
+        let arg_count = args.len();
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // env_ptr
+        for _ in 0..arg_count {
+            sig.params.push(AbiParam::new(types::I64)); // tag
+            sig.params.push(AbiParam::new(types::I64)); // payload
+        }
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+
+        let sig_ref = builder.import_signature(sig);
+        let call = builder.ins().call_indirect(sig_ref, func_ptr, &call_args);
+        let results = builder.inst_results(call);
+        Ok((results[0], results[1]))
+    }
+
     fn emit_bridge_io(
         name: &str,
         args: &[Value],
@@ -753,11 +1353,12 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.len() != 1 {
             return Err(format!("{} requires 1 argument", name));
         }
-        let (tag, payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges)?;
+        let (tag, payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
         let bridge_id = bridges.get(name)
             .ok_or_else(|| format!("bridge function {} not found", name))?;
         let local_func = module.declare_func_in_func(*bridge_id, builder.func);
@@ -777,6 +1378,7 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.is_empty() {
             return Err("loop requires bindings".to_string());
@@ -796,7 +1398,7 @@ impl Compiler {
         let mut init_payloads = Vec::new();
         for chunk in bindings.chunks(2) {
             let name = chunk[0].as_symbol().map_err(|e| e.to_string())?.to_string();
-            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges, lambdas)?;
             names.push(name);
             init_tags.push(tag);
             init_payloads.push(payload);
@@ -837,7 +1439,7 @@ impl Compiler {
         let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
         let mut last_payload = builder.ins().iconst(types::I64, 0);
         for expr in body {
-            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges, lambdas)?;
             last_tag = tag;
             last_payload = payload;
         }
@@ -870,6 +1472,7 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         let (loop_header, ref names) = scope.loop_ctx.clone()
             .ok_or_else(|| "recur outside of loop".to_string())?;
@@ -881,7 +1484,7 @@ impl Compiler {
         // Evaluate recur arguments
         let mut jump_args = Vec::new();
         for arg in args {
-            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges, lambdas)?;
             jump_args.push(tag);
             jump_args.push(payload);
         }
@@ -909,6 +1512,7 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         if args.is_empty() {
             // Empty list = nil
@@ -928,7 +1532,7 @@ impl Compiler {
         ));
 
         for (i, arg) in args.iter().enumerate() {
-            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges, lambdas)?;
             let offset_tag = (i * 2 * 8) as i32;
             let offset_payload = (i * 2 * 8 + 8) as i32;
             builder.ins().stack_store(tag, stack_slot, offset_tag);
@@ -956,13 +1560,14 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         let bridge_id = bridges.get(name)
             .ok_or_else(|| format!("bridge function {} not found", name))?;
 
         let mut call_args = Vec::new();
         for arg in args {
-            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges, lambdas)?;
             call_args.push(tag);
             call_args.push(payload);
         }
@@ -982,15 +1587,191 @@ impl Compiler {
         functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
         let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
         let mut last_payload = builder.ins().iconst(types::I64, 0);
         for expr in args {
-            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges)?;
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges, lambdas)?;
             last_tag = tag;
             last_payload = payload;
         }
         Ok((last_tag, last_payload))
+    }
+
+    /// Find free variables in an expression (variables used but not defined locally).
+    fn free_vars(expr: &Value, bound: &std::collections::HashSet<String>) -> std::collections::HashSet<String> {
+        use std::collections::HashSet;
+        match expr {
+            Value::Symbol(s) => {
+                let name = s.as_str();
+                if !bound.contains(name) {
+                    let mut set = HashSet::new();
+                    set.insert(name.to_string());
+                    set
+                } else {
+                    HashSet::new()
+                }
+            }
+            Value::List(items) | Value::Vec(items) => {
+                if items.is_empty() {
+                    return HashSet::new();
+                }
+                // Check for binding forms
+                if let Value::Symbol(sym) = &items[0] {
+                    match sym.as_str() {
+                        "fn" if items.len() >= 3 => {
+                            // (fn (params) body...) — params are bound
+                            let mut inner_bound = bound.clone();
+                            if let Value::List(params) | Value::Vec(params) = &items[1] {
+                                for p in params.iter() {
+                                    if let Value::Symbol(s) = p {
+                                        inner_bound.insert(s.to_string());
+                                    }
+                                }
+                            }
+                            let mut fv = HashSet::new();
+                            for e in &items[2..] {
+                                fv.extend(Self::free_vars(e, &inner_bound));
+                            }
+                            return fv;
+                        }
+                        "let" if items.len() >= 2 => {
+                            let mut inner_bound = bound.clone();
+                            let mut fv = HashSet::new();
+                            if let Value::List(bindings) | Value::Vec(bindings) = &items[1] {
+                                for chunk in bindings.chunks(2) {
+                                    if chunk.len() == 2 {
+                                        fv.extend(Self::free_vars(&chunk[1], &inner_bound));
+                                        if let Value::Symbol(s) = &chunk[0] {
+                                            inner_bound.insert(s.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            for e in &items[2..] {
+                                fv.extend(Self::free_vars(e, &inner_bound));
+                            }
+                            return fv;
+                        }
+                        "loop" if items.len() >= 2 => {
+                            let mut inner_bound = bound.clone();
+                            let mut fv = HashSet::new();
+                            if let Value::List(bindings) | Value::Vec(bindings) = &items[1] {
+                                for chunk in bindings.chunks(2) {
+                                    if chunk.len() == 2 {
+                                        fv.extend(Self::free_vars(&chunk[1], &inner_bound));
+                                        if let Value::Symbol(s) = &chunk[0] {
+                                            inner_bound.insert(s.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            for e in &items[2..] {
+                                fv.extend(Self::free_vars(e, &inner_bound));
+                            }
+                            return fv;
+                        }
+                        "def" if items.len() >= 3 => {
+                            let fv = Self::free_vars(&items[2], bound);
+                            return fv;
+                        }
+                        "defun" | "quote" | "defmacro" => return HashSet::new(),
+                        _ => {}
+                    }
+                }
+                let mut fv = HashSet::new();
+                for item in items.iter() {
+                    fv.extend(Self::free_vars(item, bound));
+                }
+                fv
+            }
+            _ => std::collections::HashSet::new(),
+        }
+    }
+
+    /// Pre-pass: collect all fn expressions, assign names, and register them.
+    /// Returns lambdas to compile and rewrites fn expressions with lambda references.
+    fn collect_lambdas(exprs: &[Value]) -> (Vec<Value>, Vec<LambdaInfo>) {
+        let mut lambdas = Vec::new();
+        let mut counter = 0usize;
+        let rewritten: Vec<Value> = exprs.iter()
+            .map(|e| Self::rewrite_fn_expr(e, &mut lambdas, &mut counter))
+            .collect();
+        (rewritten, lambdas)
+    }
+
+    /// Rewrite fn expressions to __lambda_N references, collecting LambdaInfos.
+    fn rewrite_fn_expr(expr: &Value, lambdas: &mut Vec<LambdaInfo>, counter: &mut usize) -> Value {
+        match expr {
+            Value::List(items) if !items.is_empty() => {
+                if let Value::Symbol(sym) = &items[0] {
+                    if sym.as_str() == "fn" && items.len() >= 3 {
+                        // (fn (params) body...)
+                        let params: Vec<String> = if let Value::List(ps) | Value::Vec(ps) = &items[1] {
+                            ps.iter().filter_map(|p| {
+                                if let Value::Symbol(s) = p { Some(s.to_string()) } else { None }
+                            }).collect()
+                        } else {
+                            vec![]
+                        };
+
+                        // Recursively rewrite body first
+                        let body: Vec<Value> = items[2..].iter()
+                            .map(|e| Self::rewrite_fn_expr(e, lambdas, counter))
+                            .collect();
+
+                        // Find free variables
+                        let mut bound: std::collections::HashSet<String> = params.iter().cloned().collect();
+                        // Add well-known names (builtins, special forms) so they don't count as captures
+                        for name in &["+", "-", "*", "/", "%", "=", "<", ">", "<=", ">=", "!=",
+                            "not", "if", "do", "let", "def", "defun", "fn", "loop", "recur",
+                            "list", "cons", "first", "rest", "count", "nth", "empty?", "concat",
+                            "println", "print", "str", "nil?", "number?", "string?", "list?", "fn?",
+                            "true", "false", "nil", "when", "unless", "map", "filter", "reduce",
+                            "apply", "identity", "match", "throw", "try", "catch", "quote",
+                            "quasiquote"] {
+                            bound.insert(name.to_string());
+                        }
+
+                        let mut fv: Vec<String> = Self::free_vars(
+                            &Value::list(body.clone().into_iter().chain(std::iter::empty()).collect()),
+                            &bound,
+                        ).into_iter().collect();
+                        fv.sort(); // deterministic order
+
+                        let name = format!("__lambda_{}", *counter);
+                        *counter += 1;
+
+                        lambdas.push(LambdaInfo {
+                            name: name.clone(),
+                            params,
+                            body,
+                            captures: fv.clone(),
+                        });
+
+                        // Replace (fn ...) with (__make_closure "__lambda_N" cap1 cap2 ...)
+                        let mut closure_expr = vec![
+                            Value::symbol("__make_closure"),
+                            Value::str(name),
+                        ];
+                        for cap in &fv {
+                            closure_expr.push(Value::symbol(cap.clone()));
+                        }
+                        return Value::list(closure_expr);
+                    }
+                    if sym.as_str() == "quote" {
+                        return expr.clone();
+                    }
+                }
+                // Recursively rewrite children
+                Value::list(items.iter().map(|e| Self::rewrite_fn_expr(e, lambdas, counter)).collect())
+            }
+            Value::Vec(items) => {
+                Value::vec(items.iter().map(|e| Self::rewrite_fn_expr(e, lambdas, counter)).collect())
+            }
+            _ => expr.clone(),
+        }
     }
 
     /// Macro expansion pre-pass: evaluate defmacro forms and expand macros in the AST.
@@ -1060,11 +1841,37 @@ impl Compiler {
         // Pass 0: macro expansion
         let exprs = Self::expand_macros(exprs)?;
 
+        // Pass 0.5: collect lambda (fn) expressions and rewrite them
+        let (exprs, lambda_infos) = Self::collect_lambdas(&exprs);
+
         // Pass 1: collect strings
         self.collect_strings(&exprs)?;
 
         // Pass 2: declare all top-level functions
         self.declare_functions(&exprs)?;
+
+        // Pass 2.5: declare and compile lambda functions
+        // Lambda signature: (env_ptr, param0_tag, param0_payload, ...) → (tag, payload)
+        for info in &lambda_infos {
+            let param_count = info.params.len();
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // env_ptr (closure data)
+            for _ in 0..param_count {
+                sig.params.push(AbiParam::new(types::I64)); // tag
+                sig.params.push(AbiParam::new(types::I64)); // payload
+            }
+            sig.returns.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let func_name = format!("_lsp_fn_{}", info.name);
+            let func_id = self.module
+                .declare_function(&func_name, Linkage::Local, &sig)
+                .map_err(|e| e.to_string())?;
+            self.lambdas.insert(info.name.clone(), (func_id, param_count, info.captures.len()));
+        }
+        // Compile lambda bodies
+        for info in &lambda_infos {
+            self.compile_lambda(info)?;
+        }
 
         // Pass 3: compile each defun (single + multi-arity)
         // Collect defun info first to avoid borrow issues
@@ -1147,6 +1954,7 @@ impl Compiler {
                     &self.functions,
                     &mut scope,
                     &self.bridges,
+                    &self.lambdas,
                 )?;
                 last_tag = tag;
                 last_payload = payload;
@@ -1284,6 +2092,17 @@ mod tests {
 
         let exprs = parse("(/ 10 2)").unwrap();
         assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_variadic_arithmetic() {
+        let exprs = parse("(+ 1 2 3 4 5)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+
+        let exprs = parse("(* 2 3 4)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
     }
 
     #[test]
@@ -1444,6 +2263,100 @@ mod tests {
     #[test]
     fn test_compile_list_in_defun() {
         let exprs = parse("(defun sum-list (xs) (loop [remaining xs acc 0] (if (empty? remaining) acc (recur (rest remaining) (+ acc (first remaining)))))) (sum-list (list 1 2 3 4 5))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_destructure_vec() {
+        let exprs = parse("(let [[a b c] (list 1 2 3)] (+ a b c))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_destructure_nested() {
+        let exprs = parse("(let [[a [b c]] (list 1 (list 2 3))] (+ a b c))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_fn_simple() {
+        // Lambda without captures
+        let exprs = parse("(def add1 (fn (x) (+ x 1))) (add1 5)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_fn_closure() {
+        // Lambda with closure capture
+        let exprs = parse("(def offset 10) (def add-offset (fn (x) (+ x offset))) (add-offset 5)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_fn_as_arg() {
+        // Pass lambda to a function
+        let exprs = parse("(defun apply-fn (f x) (f x)) (apply-fn (fn (n) (+ n 1)) 10)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_match_literal() {
+        let exprs = parse("(match 1 1 \"one\" 2 \"two\" _ \"other\")").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_match_wildcard() {
+        let exprs = parse("(match 42 _ \"matched\")").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_match_binding() {
+        let exprs = parse("(match 5 x (+ x 1))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_match_bool() {
+        let exprs = parse("(match true true 1 false 0)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_match_nil() {
+        let exprs = parse("(match nil nil \"nil\" _ \"not nil\")").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_throw() {
+        let exprs = parse("(throw 42)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_try_catch() {
+        let exprs = parse("(try (throw 42) (catch e e))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_try_no_error() {
+        let exprs = parse("(try (+ 1 2) (catch e 0))").unwrap();
         let result = Compiler::new().unwrap().compile_exprs(&exprs);
         assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
     }

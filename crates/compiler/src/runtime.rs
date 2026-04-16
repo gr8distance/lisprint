@@ -110,6 +110,45 @@ fn leak_string(s: String) -> *const u8 {
     ptr
 }
 
+// --- Error handling runtime ---
+// Global error state (thread-local for safety)
+use std::cell::RefCell;
+
+thread_local! {
+    static ERROR_STATE: RefCell<Option<(i64, i64)>> = RefCell::new(None);
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_throw(tag: i64, payload: i64) {
+    ERROR_STATE.with(|state| {
+        *state.borrow_mut() = Some((tag, payload));
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_has_error() -> i64 {
+    ERROR_STATE.with(|state| {
+        if state.borrow().is_some() { 1 } else { 0 }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_get_error() -> TaggedValue {
+    ERROR_STATE.with(|state| {
+        match *state.borrow() {
+            Some((tag, payload)) => TaggedValue { tag, payload },
+            None => TaggedValue { tag: TAG_NIL, payload: 0 },
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn lsp_clear_error() {
+    ERROR_STATE.with(|state| {
+        *state.borrow_mut() = None;
+    });
+}
+
 // --- List runtime ---
 // Lists are stored as heap-allocated arrays: [count, tag0, payload0, tag1, payload1, ...]
 // The payload of a TAG_LIST value is a pointer to such an array.
