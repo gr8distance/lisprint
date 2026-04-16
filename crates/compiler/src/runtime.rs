@@ -1,7 +1,7 @@
 //! Runtime support functions for compiled lisprint code.
 //! These are linked into the final binary and called from generated code.
 
-use super::compiler::{TAG_NIL, TAG_BOOL, TAG_INT, TAG_FLOAT, TAG_STR, TAG_LIST};
+use super::compiler::{TAG_NIL, TAG_BOOL, TAG_INT, TAG_FLOAT, TAG_STR, TAG_LIST, TAG_TYPE};
 
 /// FFI-safe return type for functions that return (tag, payload)
 #[repr(C)]
@@ -55,6 +55,23 @@ pub extern "C" fn lsp_print(tag: i64, payload: i64) {
                 }
             }
             print!(")");
+        }
+        TAG_TYPE => {
+            let inst = payload as *const TypeInstanceRT;
+            if !inst.is_null() {
+                unsafe {
+                    let inst = &*inst;
+                    let type_name = read_str(inst.type_name_ptr);
+                    print!("({}", type_name);
+                    let fields = std::slice::from_raw_parts(inst.fields_ptr, inst.field_count as usize);
+                    for field in fields {
+                        let name = read_str(field.name_ptr);
+                        print!(" :{} ", name);
+                        lsp_print(field.tag, field.payload);
+                    }
+                    print!(")");
+                }
+            }
         }
         _ => print!("<unknown:{}>", tag),
     }
@@ -315,4 +332,86 @@ pub extern "C" fn lsp_concat(tag1: i64, payload1: i64, tag2: i64, payload2: i64)
         return TaggedValue { tag: TAG_NIL, payload: 0 };
     }
     TaggedValue { tag: TAG_LIST, payload: alloc_list(&pairs) }
+}
+
+// --- Type instance runtime ---
+
+/// Runtime representation of a field in a TypeInstance
+#[repr(C)]
+pub struct FieldRT {
+    pub name_ptr: i64,   // pointer to null-terminated string
+    pub tag: i64,
+    pub payload: i64,
+}
+
+/// Runtime representation of a TypeInstance
+#[repr(C)]
+pub struct TypeInstanceRT {
+    pub type_name_ptr: i64,
+    pub field_count: i64,
+    pub fields_ptr: *const FieldRT,
+}
+
+/// Create a new TypeInstance.
+/// field_data is an array of [name_ptr, tag, payload, name_ptr, tag, payload, ...]
+#[no_mangle]
+pub extern "C" fn lsp_type_new(type_name_ptr: i64, field_count: i64, field_data_ptr: i64) -> TaggedValue {
+    let count = field_count as usize;
+    let mut fields = Vec::with_capacity(count);
+    unsafe {
+        let data = field_data_ptr as *const i64;
+        for i in 0..count {
+            let name_ptr = *data.add(i * 3);
+            let tag = *data.add(i * 3 + 1);
+            let payload = *data.add(i * 3 + 2);
+            fields.push(FieldRT { name_ptr, tag, payload });
+        }
+    }
+    let fields_boxed = fields.into_boxed_slice();
+    let fields_ptr = fields_boxed.as_ptr();
+    std::mem::forget(fields_boxed);
+
+    let inst = Box::new(TypeInstanceRT {
+        type_name_ptr,
+        field_count,
+        fields_ptr,
+    });
+    let ptr = Box::into_raw(inst);
+    TaggedValue { tag: TAG_TYPE, payload: ptr as i64 }
+}
+
+/// Get a field from a TypeInstance by name
+#[no_mangle]
+pub extern "C" fn lsp_type_get_field(inst_tag: i64, inst_payload: i64, field_name_ptr: i64) -> TaggedValue {
+    if inst_tag != TAG_TYPE {
+        return TaggedValue { tag: TAG_NIL, payload: 0 };
+    }
+    let inst = inst_payload as *const TypeInstanceRT;
+    let field_name = read_str(field_name_ptr);
+    unsafe {
+        let inst = &*inst;
+        let fields = std::slice::from_raw_parts(inst.fields_ptr, inst.field_count as usize);
+        for field in fields {
+            let name = read_str(field.name_ptr);
+            if name == field_name {
+                return TaggedValue { tag: field.tag, payload: field.payload };
+            }
+        }
+    }
+    TaggedValue { tag: TAG_NIL, payload: 0 }
+}
+
+/// Check if a value is an instance of a given type
+#[no_mangle]
+pub extern "C" fn lsp_type_check(inst_tag: i64, inst_payload: i64, type_name_ptr: i64) -> TaggedValue {
+    if inst_tag != TAG_TYPE {
+        return TaggedValue { tag: TAG_BOOL, payload: 0 };
+    }
+    let inst = inst_payload as *const TypeInstanceRT;
+    let expected = read_str(type_name_ptr);
+    unsafe {
+        let inst = &*inst;
+        let actual = read_str(inst.type_name_ptr);
+        TaggedValue { tag: TAG_BOOL, payload: if actual == expected { 1 } else { 0 } }
+    }
 }

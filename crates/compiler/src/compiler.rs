@@ -22,6 +22,7 @@ pub const TAG_FLOAT: i64 = 3;
 pub const TAG_STR: i64 = 4;
 pub const TAG_LIST: i64 = 5;
 pub const TAG_FN: i64 = 6;
+pub const TAG_TYPE: i64 = 7;
 
 use cranelift_codegen::ir::Block;
 
@@ -198,6 +199,41 @@ impl Compiler {
             .map_err(|e| e.to_string())?;
         self.bridges.insert("clear_error".to_string(), id);
 
+        // --- Type instance operations ---
+        // lsp_type_new(type_name_ptr: i64, field_count: i64, field_data_ptr: i64) -> (tag, payload)
+        // field_data_ptr points to: [name0_ptr, val0_tag, val0_payload, name1_ptr, ...]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_type_new", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("type_new".to_string(), id);
+
+        // lsp_type_get_field(inst_tag, inst_payload, field_name_ptr) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_type_get_field", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("type_get_field".to_string(), id);
+
+        // lsp_type_check(inst_tag, inst_payload, type_name_ptr) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_type_check", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("type_check".to_string(), id);
+
         // --- List operations ---
         // All list bridge functions: (tag, payload)* -> (tag, payload)
 
@@ -314,6 +350,12 @@ impl Compiler {
     fn collect_strings_in_expr(&mut self, expr: &Value) -> Result<(), String> {
         match expr {
             Value::Str(s) => { self.ensure_string(s)?; }
+            Value::Symbol(s) => {
+                // Collect .field names as strings for type field access
+                if s.starts_with('.') && s.len() > 1 {
+                    self.ensure_string(&s[1..])?;
+                }
+            }
             Value::List(items) | Value::Vec(items) => {
                 for item in items.iter() {
                     self.collect_strings_in_expr(item)?;
@@ -613,7 +655,7 @@ impl Compiler {
                         "throw" => return Self::emit_throw(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
                         "try" => return Self::emit_try(&items[1..], builder, module, strings, functions, scope, bridges, lambdas),
                         "println" | "print" => return Self::emit_bridge_io(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges, lambdas),
-                        "defun" => {
+                        "defun" | "deftest" | "ns" | "require" | "deftrait" | "export" => {
                             let tag = builder.ins().iconst(types::I64, TAG_NIL);
                             let payload = builder.ins().iconst(types::I64, 0);
                             return Ok((tag, payload));
@@ -621,7 +663,19 @@ impl Compiler {
                         "__make_closure" => {
                             return Self::emit_make_closure(&items[1..], builder, module, scope, lambdas);
                         }
-                        _ => {}
+                        "__type_new" => {
+                            return Self::emit_type_new(&items[1..], builder, module, strings, functions, scope, bridges, lambdas);
+                        }
+                        "__type_check" => {
+                            return Self::emit_type_check(&items[1..], builder, module, strings, functions, scope, bridges, lambdas);
+                        }
+                        _ => {
+                            // .field access: (.field obj) → lsp_type_get_field
+                            if sym.starts_with('.') && sym.len() > 1 && items.len() == 2 {
+                                let field_name = &sym[1..];
+                                return Self::emit_dot_access(field_name, &items[1], builder, module, strings, functions, scope, bridges, lambdas);
+                            }
+                        }
                     }
 
                     // Function call — find matching arity
@@ -1082,6 +1136,124 @@ impl Compiler {
         let result_tag = builder.block_params(merge_block)[0];
         let result_payload = builder.block_params(merge_block)[1];
         Ok((result_tag, result_payload))
+    }
+
+    /// (__type_new "TypeName" val1 "field1" val2 "field2" ...)
+    fn emit_type_new(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        // args: "TypeName" val1 "field1" val2 "field2" ...
+        if args.is_empty() {
+            return Err("__type_new requires type name".to_string());
+        }
+        let type_name_str = args[0].as_str().map_err(|e| e.to_string())?;
+        let type_name_data_id = strings.get(type_name_str)
+            .ok_or_else(|| format!("string not pre-declared: {}", type_name_str))?;
+        let type_name_gv = module.declare_data_in_func(*type_name_data_id, builder.func);
+        let type_name_ptr = builder.ins().global_value(types::I64, type_name_gv);
+
+        // Pairs: (value, "field_name"), (value, "field_name"), ...
+        let field_data = &args[1..];
+        let field_count = field_data.len() / 2;
+
+        // Stack slot for field data: [name_ptr, tag, payload, name_ptr, tag, payload, ...]
+        let slot_size = (field_count * 3 * 8) as u32;
+        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            slot_size,
+            0,
+        ));
+
+        for i in 0..field_count {
+            let val_expr = &field_data[i * 2];
+            let field_name_expr = &field_data[i * 2 + 1];
+            let field_name_str = field_name_expr.as_str().map_err(|e| e.to_string())?;
+
+            let field_name_data_id = strings.get(field_name_str)
+                .ok_or_else(|| format!("string not pre-declared: {}", field_name_str))?;
+            let field_name_gv = module.declare_data_in_func(*field_name_data_id, builder.func);
+            let field_name_ptr = builder.ins().global_value(types::I64, field_name_gv);
+
+            let (tag, payload) = Self::emit_expr(val_expr, builder, module, strings, functions, scope, bridges, lambdas)?;
+
+            let base = (i * 3 * 8) as i32;
+            builder.ins().stack_store(field_name_ptr, slot, base);
+            builder.ins().stack_store(tag, slot, base + 8);
+            builder.ins().stack_store(payload, slot, base + 16);
+        }
+
+        let data_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+        let count_val = builder.ins().iconst(types::I64, field_count as i64);
+
+        let bridge_id = bridges.get("type_new")
+            .ok_or_else(|| "bridge function type_new not found".to_string())?;
+        let local_func = module.declare_func_in_func(*bridge_id, builder.func);
+        let call = builder.ins().call(local_func, &[type_name_ptr, count_val, data_ptr]);
+        let results = builder.inst_results(call);
+        Ok((results[0], results[1]))
+    }
+
+    /// (__type_check value "TypeName")
+    fn emit_type_check(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.len() != 2 {
+            return Err("__type_check requires value and type name".to_string());
+        }
+        let (tag, payload) = Self::emit_expr(&args[0], builder, module, strings, functions, scope, bridges, lambdas)?;
+        let type_name_str = args[1].as_str().map_err(|e| e.to_string())?;
+        let type_name_data_id = strings.get(type_name_str)
+            .ok_or_else(|| format!("string not pre-declared: {}", type_name_str))?;
+        let type_name_gv = module.declare_data_in_func(*type_name_data_id, builder.func);
+        let type_name_ptr = builder.ins().global_value(types::I64, type_name_gv);
+
+        let bridge_id = bridges.get("type_check")
+            .ok_or_else(|| "bridge function type_check not found".to_string())?;
+        let local_func = module.declare_func_in_func(*bridge_id, builder.func);
+        let call = builder.ins().call(local_func, &[tag, payload, type_name_ptr]);
+        let results = builder.inst_results(call);
+        Ok((results[0], results[1]))
+    }
+
+    /// (.field obj) → lsp_type_get_field(obj, "field")
+    fn emit_dot_access(
+        field_name: &str,
+        obj_expr: &Value,
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+        lambdas: &HashMap<String, (FuncId, usize, usize)>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        let (tag, payload) = Self::emit_expr(obj_expr, builder, module, strings, functions, scope, bridges, lambdas)?;
+
+        let field_data_id = strings.get(field_name)
+            .ok_or_else(|| format!("string not pre-declared: {}", field_name))?;
+        let field_gv = module.declare_data_in_func(*field_data_id, builder.func);
+        let field_ptr = builder.ins().global_value(types::I64, field_gv);
+
+        let bridge_id = bridges.get("type_get_field")
+            .ok_or_else(|| "bridge function type_get_field not found".to_string())?;
+        let local_func = module.declare_func_in_func(*bridge_id, builder.func);
+        let call = builder.ins().call(local_func, &[tag, payload, field_ptr]);
+        let results = builder.inst_results(call);
+        Ok((results[0], results[1]))
     }
 
     /// (match value pattern1 expr1 pattern2 expr2 ...)
@@ -1783,13 +1955,125 @@ impl Compiler {
 
         let mut result = Vec::new();
         for expr in exprs {
-            // Evaluate defmacro forms to register macros, then skip them
             if let Value::List(items) = expr {
                 if let Some(Value::Symbol(sym)) = items.first() {
-                    if sym.as_str() == "defmacro" {
-                        eval::eval(expr, &mut env)
-                            .map_err(|e| format!("macro definition error: {}", e))?;
-                        continue;
+                    match sym.as_str() {
+                        // Evaluate defmacro forms to register macros, then skip them
+                        "defmacro" => {
+                            eval::eval(expr, &mut env)
+                                .map_err(|e| format!("macro definition error: {}", e))?;
+                            continue;
+                        }
+                        // Rewrite (deftype Name (field1 field2 ...)) to defun constructor + predicate
+                        "deftype" if items.len() == 3 => {
+                            if let (Value::Symbol(type_name), Value::List(fields)) | (Value::Symbol(type_name), Value::Vec(fields)) = (&items[1], &items[2]) {
+                                let field_names: Vec<String> = fields.iter()
+                                    .filter_map(|f| if let Value::Symbol(s) = f { Some(s.to_string()) } else { None })
+                                    .collect();
+                                // Generate: (defun TypeName (field1 field2 ...) (__type_new "TypeName" (field1 "field1") (field2 "field2") ...))
+                                let mut type_new_args = vec![
+                                    Value::symbol("__type_new"),
+                                    Value::str(type_name.as_str()),
+                                ];
+                                for fname in &field_names {
+                                    type_new_args.push(Value::symbol(fname.clone()));
+                                    type_new_args.push(Value::str(fname.as_str()));
+                                }
+                                let params = Value::list(field_names.iter().map(|n| Value::symbol(n.clone())).collect());
+                                let constructor = Value::list(vec![
+                                    Value::symbol("defun"),
+                                    Value::symbol(type_name.as_str()),
+                                    params,
+                                    Value::list(type_new_args),
+                                ]);
+                                result.push(constructor);
+
+                                // Generate: (defun TypeName? (v) (__type_check v "TypeName"))
+                                let pred_name = format!("{}?", type_name);
+                                let predicate = Value::list(vec![
+                                    Value::symbol("defun"),
+                                    Value::symbol(pred_name),
+                                    Value::list(vec![Value::symbol("v")]),
+                                    Value::list(vec![
+                                        Value::symbol("__type_check"),
+                                        Value::symbol("v"),
+                                        Value::str(type_name.as_str()),
+                                    ]),
+                                ]);
+                                result.push(predicate);
+                                continue;
+                            }
+                        }
+                        // deftrait — just skip (metadata only, not needed at compile time)
+                        "deftrait" => { continue; }
+                        // ns — skip (flat namespace in compiled mode)
+                        "ns" => { continue; }
+                        // require — inline the module's definitions
+                        "require" if items.len() >= 2 => {
+                            let mod_name = match &items[1] {
+                                Value::Symbol(s) => s.to_string(),
+                                Value::Str(s) => s.to_string(),
+                                _ => {
+                                    // quote: (require 'name)
+                                    if let Value::List(inner) = &items[1] {
+                                        if inner.len() == 2 {
+                                            if let Value::Symbol(s) = &inner[0] {
+                                                if s.as_str() == "quote" {
+                                                    if let Value::Symbol(name) = &inner[1] {
+                                                        name.to_string()
+                                                    } else { continue; }
+                                                } else { continue; }
+                                            } else { continue; }
+                                        } else { continue; }
+                                    } else { continue; }
+                                }
+                            };
+
+                            // Skip stdlib modules (runtime-only)
+                            let stdlib_mods = ["math", "str", "fs", "os", "json", "uuid",
+                                "time", "re", "http", "http/server", "async"];
+                            if stdlib_mods.contains(&mod_name.as_str()) {
+                                continue;
+                            }
+
+                            // Try to load the file
+                            let file_path = format!("{}.lisp", mod_name.replace('/', std::path::MAIN_SEPARATOR_STR));
+                            if let Ok(source) = std::fs::read_to_string(&file_path) {
+                                if let Ok(mod_exprs) = lisprint_core::parser::parse(&source) {
+                                    // Recursively expand the module and add to result
+                                    let expanded_mod = Self::expand_macros(&mod_exprs)?;
+                                    for e in expanded_mod {
+                                        result.push(e);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        // defimpl — rewrite methods to special internal functions
+                        "defimpl" if items.len() >= 4 => {
+                            if let (Value::Symbol(_trait_name), Value::Symbol(type_name)) = (&items[1], &items[2]) {
+                                for method_def in &items[3..] {
+                                    if let Value::List(method_items) = method_def {
+                                        if method_items.len() >= 3 {
+                                            if let Value::Symbol(method_name) = &method_items[0] {
+                                                // Generate: (defun __trait:TypeName/method__ (params...) body...)
+                                                let internal_name = format!("__trait:{}/{}__", type_name, method_name);
+                                                let mut defun = vec![
+                                                    Value::symbol("defun"),
+                                                    Value::symbol(internal_name),
+                                                ];
+                                                for item in &method_items[1..] {
+                                                    defun.push(Self::expand_expr(item, &mut env)?);
+                                                }
+                                                result.push(Value::list(defun));
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -2357,6 +2641,43 @@ mod tests {
     #[test]
     fn test_compile_try_no_error() {
         let exprs = parse("(try (+ 1 2) (catch e 0))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_deftype() {
+        let exprs = parse("(deftype Point (x y)) (def p (Point 1 2)) (.x p)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_deftype_predicate() {
+        let exprs = parse("(deftype Point (x y)) (def p (Point 1 2)) (Point? p)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_defimpl() {
+        let exprs = parse("(deftype Point (x y)) (deftrait Printable (to-str (self))) (defimpl Printable Point (to-str (self) (.x self))) (def p (Point 10 20))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_ns() {
+        // ns should be skipped silently
+        let exprs = parse("(ns mymodule (export add)) (defun add (a b) (+ a b)) (add 1 2)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_deftest_skipped() {
+        // deftest should be skipped in compiled output
+        let exprs = parse("(defun f (x) x) (deftest my-test (assert= 1 1)) (f 42)").unwrap();
         let result = Compiler::new().unwrap().compile_exprs(&exprs);
         assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
     }
