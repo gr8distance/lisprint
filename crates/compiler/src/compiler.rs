@@ -8,6 +8,10 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{default_libcall_names, DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
+use lisprint_core::builtins;
+use lisprint_core::env::Env;
+use lisprint_core::eval;
+use lisprint_core::prelude;
 use lisprint_core::value::Value;
 
 /// Runtime value tag constants
@@ -16,12 +20,17 @@ pub const TAG_BOOL: i64 = 1;
 pub const TAG_INT: i64 = 2;
 pub const TAG_FLOAT: i64 = 3;
 pub const TAG_STR: i64 = 4;
+pub const TAG_LIST: i64 = 5;
+
+use cranelift_codegen::ir::Block;
 
 /// Tracks local variables within a function being compiled.
 /// Each Lisp value is represented as two Cranelift Variables: (tag, payload).
 struct FnScope {
     locals: HashMap<String, (Variable, Variable)>,
     next_var: u32,
+    /// Active loop context for recur: (header_block, binding_names)
+    loop_ctx: Option<(Block, Vec<String>)>,
 }
 
 impl FnScope {
@@ -29,6 +38,7 @@ impl FnScope {
         Self {
             locals: HashMap::new(),
             next_var: 0,
+            loop_ctx: None,
         }
     }
 
@@ -55,8 +65,8 @@ pub struct Compiler {
     func_ctx: FunctionBuilderContext,
     strings: HashMap<String, DataId>,
     next_str_id: usize,
-    /// Declared functions: name → (FuncId, param_count)
-    functions: HashMap<String, (FuncId, usize)>,
+    /// Declared functions: name → list of (FuncId, param_count) for multi-arity support
+    functions: HashMap<String, Vec<(FuncId, usize)>>,
     next_func_idx: u32,
     /// Bridge (runtime) functions: name → FuncId
     bridges: HashMap<String, FuncId>,
@@ -139,6 +149,87 @@ impl Compiler {
             .map_err(|e| e.to_string())?;
         self.bridges.insert("to-string".to_string(), id);
 
+        // --- List operations ---
+        // All list bridge functions: (tag, payload)* -> (tag, payload)
+
+        // lsp_list_new(count: i64, elements: *const i64) -> (tag, payload)
+        // elements is a pointer to array of [tag, payload, tag, payload, ...]
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // count
+        sig.params.push(AbiParam::new(types::I64)); // elements ptr
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_list_new", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("list_new".to_string(), id);
+
+        // lsp_cons(tag, payload, list_tag, list_payload) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        for _ in 0..4 { sig.params.push(AbiParam::new(types::I64)); }
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_cons", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("cons".to_string(), id);
+
+        // lsp_first(tag, payload) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_first", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("first".to_string(), id);
+
+        // lsp_rest(tag, payload) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_rest", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("rest".to_string(), id);
+
+        // lsp_count(tag, payload) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_count", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("count".to_string(), id);
+
+        // lsp_nth(list_tag, list_payload, idx_tag, idx_payload) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        for _ in 0..4 { sig.params.push(AbiParam::new(types::I64)); }
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_nth", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("nth".to_string(), id);
+
+        // lsp_empty(tag, payload) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_empty", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("empty?".to_string(), id);
+
+        // lsp_concat(tag1, payload1, tag2, payload2) -> (tag, payload)
+        let mut sig = self.module.make_signature();
+        for _ in 0..4 { sig.params.push(AbiParam::new(types::I64)); }
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = self.module.declare_function("lsp_concat", Linkage::Import, &sig)
+            .map_err(|e| e.to_string())?;
+        self.bridges.insert("concat".to_string(), id);
+
         Ok(())
     }
 
@@ -200,19 +291,43 @@ impl Compiler {
     fn declare_functions(&mut self, exprs: &[Value]) -> Result<(), String> {
         for expr in exprs {
             if let Value::List(items) = expr {
-                if items.len() >= 4 {
+                if items.len() >= 3 {
                     if let Value::Symbol(sym) = &items[0] {
                         if sym.as_str() == "defun" {
                             if let Value::Symbol(name) = &items[1] {
-                                // (defun name (params...) body...)
-                                if let Value::List(params) = &items[2] {
+                                // Check if multi-arity: (defun name ((params1) body1) ((params2) body2) ...)
+                                let is_multi = if let Value::List(first_clause) = &items[2] {
+                                    !first_clause.is_empty() && matches!(&first_clause[0], Value::List(_) | Value::Vec(_))
+                                } else {
+                                    false
+                                };
+
+                                if is_multi {
+                                    for (arity_idx, clause) in items[2..].iter().enumerate() {
+                                        if let Value::List(clause_items) = clause {
+                                            if let Some(Value::List(params)) = clause_items.first() {
+                                                let param_count = params.len();
+                                                let sig = self.make_fn_sig(param_count);
+                                                let func_name = format!("_lsp_fn_{}_{}", name, param_count);
+                                                let func_id = self.module
+                                                    .declare_function(&func_name, Linkage::Local, &sig)
+                                                    .map_err(|e| e.to_string())?;
+                                                self.functions.entry(name.to_string())
+                                                    .or_default()
+                                                    .push((func_id, param_count));
+                                                let _ = arity_idx;
+                                            }
+                                        }
+                                    }
+                                } else if let Value::List(params) = &items[2] {
+                                    // Single arity: (defun name (params...) body...)
                                     let param_count = params.len();
                                     let sig = self.make_fn_sig(param_count);
                                     let func_name = format!("_lsp_fn_{}", name);
                                     let func_id = self.module
                                         .declare_function(&func_name, Linkage::Local, &sig)
                                         .map_err(|e| e.to_string())?;
-                                    self.functions.insert(name.to_string(), (func_id, param_count));
+                                    self.functions.insert(name.to_string(), vec![(func_id, param_count)]);
                                 }
                             }
                         }
@@ -231,8 +346,12 @@ impl Compiler {
             .map_err(|e| e.to_string())?;
 
         let param_count = param_names.len();
-        let (func_id, _) = *self.functions.get(name)
+        let arities = self.functions.get(name)
             .ok_or_else(|| format!("function {} not declared", name))?;
+        let func_id = arities.iter()
+            .find(|(_, pc)| *pc == param_count)
+            .map(|(fid, _)| *fid)
+            .ok_or_else(|| format!("function {}: no arity for {} params", name, param_count))?;
 
         let sig = self.make_fn_sig(param_count);
         self.ctx.func.signature = sig;
@@ -290,7 +409,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -357,6 +476,9 @@ impl Compiler {
                         "=" | "<" | ">" | "<=" | ">=" | "!=" =>
                             return Self::emit_cmp(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
                         "not" => return Self::emit_not(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "loop" => return Self::emit_loop(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "recur" => return Self::emit_recur(&items[1..], builder, module, strings, functions, scope, bridges),
+                        "list" => return Self::emit_list_literal(&items[1..], builder, module, strings, functions, scope, bridges),
                         "println" | "print" => return Self::emit_bridge_io(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges),
                         "defun" => {
                             let tag = builder.ins().iconst(types::I64, TAG_NIL);
@@ -366,15 +488,17 @@ impl Compiler {
                         _ => {}
                     }
 
-                    // Function call
-                    if let Some(&(func_id, param_count)) = functions.get(sym.as_str()) {
+                    // Function call — find matching arity
+                    if let Some(arities) = functions.get(sym.as_str()) {
                         let args_exprs = &items[1..];
-                        if args_exprs.len() != param_count {
-                            return Err(format!(
-                                "{}: expected {} arguments, got {}",
-                                sym, param_count, args_exprs.len()
-                            ));
-                        }
+                        let arg_count = args_exprs.len();
+                        let func_id = arities.iter()
+                            .find(|(_, pc)| *pc == arg_count)
+                            .map(|(fid, _)| *fid)
+                            .ok_or_else(|| format!(
+                                "{}: no matching arity for {} arguments",
+                                sym, arg_count
+                            ))?;
 
                         // Evaluate arguments
                         let mut call_args = Vec::new();
@@ -393,6 +517,11 @@ impl Compiler {
                         let ret_payload = results[1];
                         return Ok((ret_tag, ret_payload));
                     }
+
+                    // Bridge call fallback (builtins: cons, first, rest, count, nth, empty?, concat, str)
+                    if bridges.contains_key(sym.as_str()) {
+                        return Self::emit_bridge_call(sym.as_str(), &items[1..], builder, module, strings, functions, scope, bridges);
+                    }
                 }
 
                 Err(format!("cannot compile call: {}", items[0]))
@@ -408,7 +537,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -429,7 +558,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -488,7 +617,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -531,7 +660,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -561,7 +690,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -594,7 +723,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -621,7 +750,7 @@ impl Compiler {
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -639,13 +768,218 @@ impl Compiler {
         Ok((nil_tag, nil_payload))
     }
 
+    /// (loop [bindings...] body...)
+    fn emit_loop(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.is_empty() {
+            return Err("loop requires bindings".to_string());
+        }
+
+        let bindings = match &args[0] {
+            Value::List(items) | Value::Vec(items) => items.to_vec(),
+            _ => return Err("loop bindings must be a list or vector".to_string()),
+        };
+        if bindings.len() % 2 != 0 {
+            return Err("loop bindings must have even number of elements".to_string());
+        }
+
+        // Collect binding names and evaluate initial values
+        let mut names = Vec::new();
+        let mut init_tags = Vec::new();
+        let mut init_payloads = Vec::new();
+        for chunk in bindings.chunks(2) {
+            let name = chunk[0].as_symbol().map_err(|e| e.to_string())?.to_string();
+            let (tag, payload) = Self::emit_expr(&chunk[1], builder, module, strings, functions, scope, bridges)?;
+            names.push(name);
+            init_tags.push(tag);
+            init_payloads.push(payload);
+        }
+
+        // Create loop header block with params for each binding (tag + payload)
+        let loop_header = builder.create_block();
+        for _ in 0..names.len() {
+            builder.append_block_param(loop_header, types::I64); // tag
+            builder.append_block_param(loop_header, types::I64); // payload
+        }
+
+        // Jump to loop header with initial values
+        let mut jump_args = Vec::new();
+        for i in 0..names.len() {
+            jump_args.push(init_tags[i]);
+            jump_args.push(init_payloads[i]);
+        }
+        builder.ins().jump(loop_header, &jump_args);
+
+        // Switch to loop header and bind params to variables
+        builder.switch_to_block(loop_header);
+        // Don't seal yet — recur will add a back-edge
+        for (i, name) in names.iter().enumerate() {
+            let (tag_var, payload_var) = scope.declare_var(name, builder);
+            let tag_val = builder.block_params(loop_header)[i * 2];
+            let payload_val = builder.block_params(loop_header)[i * 2 + 1];
+            builder.def_var(tag_var, tag_val);
+            builder.def_var(payload_var, payload_val);
+        }
+
+        // Set loop context so recur can find us
+        let prev_loop_ctx = scope.loop_ctx.take();
+        scope.loop_ctx = Some((loop_header, names.clone()));
+
+        // Compile body
+        let body = &args[1..];
+        let mut last_tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let mut last_payload = builder.ins().iconst(types::I64, 0);
+        for expr in body {
+            let (tag, payload) = Self::emit_expr(expr, builder, module, strings, functions, scope, bridges)?;
+            last_tag = tag;
+            last_payload = payload;
+        }
+
+        // Restore loop context
+        scope.loop_ctx = prev_loop_ctx;
+
+        // Exit block: body finished without recur, return last value
+        let exit_block = builder.create_block();
+        builder.append_block_param(exit_block, types::I64);
+        builder.append_block_param(exit_block, types::I64);
+        builder.ins().jump(exit_block, &[last_tag, last_payload]);
+
+        // Seal blocks now that all predecessors are known
+        builder.seal_block(loop_header);
+        builder.seal_block(exit_block);
+
+        builder.switch_to_block(exit_block);
+        let result_tag = builder.block_params(exit_block)[0];
+        let result_payload = builder.block_params(exit_block)[1];
+        Ok((result_tag, result_payload))
+    }
+
+    /// (recur args...)
+    fn emit_recur(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        let (loop_header, ref names) = scope.loop_ctx.clone()
+            .ok_or_else(|| "recur outside of loop".to_string())?;
+
+        if args.len() != names.len() {
+            return Err(format!("recur: expected {} args, got {}", names.len(), args.len()));
+        }
+
+        // Evaluate recur arguments
+        let mut jump_args = Vec::new();
+        for arg in args {
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges)?;
+            jump_args.push(tag);
+            jump_args.push(payload);
+        }
+
+        // Jump back to loop header
+        builder.ins().jump(loop_header, &jump_args);
+
+        // Create unreachable block for any code after recur
+        let dead_block = builder.create_block();
+        builder.switch_to_block(dead_block);
+        builder.seal_block(dead_block);
+
+        // Return dummy values (this code is unreachable)
+        let tag = builder.ins().iconst(types::I64, TAG_NIL);
+        let payload = builder.ins().iconst(types::I64, 0);
+        Ok((tag, payload))
+    }
+
+    /// (list elem1 elem2 ...) — create a list via runtime bridge
+    fn emit_list_literal(
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        if args.is_empty() {
+            // Empty list = nil
+            let tag = builder.ins().iconst(types::I64, TAG_NIL);
+            let payload = builder.ins().iconst(types::I64, 0);
+            return Ok((tag, payload));
+        }
+
+        // Evaluate all elements and store tag+payload pairs on stack
+        let count = args.len();
+        // Allocate stack slot: count * 2 * 8 bytes (tag + payload, each i64)
+        let slot_size = (count * 2 * 8) as u32;
+        let stack_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            slot_size,
+            0,
+        ));
+
+        for (i, arg) in args.iter().enumerate() {
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges)?;
+            let offset_tag = (i * 2 * 8) as i32;
+            let offset_payload = (i * 2 * 8 + 8) as i32;
+            builder.ins().stack_store(tag, stack_slot, offset_tag);
+            builder.ins().stack_store(payload, stack_slot, offset_payload);
+        }
+
+        let elements_ptr = builder.ins().stack_addr(types::I64, stack_slot, 0);
+        let count_val = builder.ins().iconst(types::I64, count as i64);
+
+        let bridge_id = bridges.get("list_new")
+            .ok_or_else(|| "bridge function list_new not found".to_string())?;
+        let local_func = module.declare_func_in_func(*bridge_id, builder.func);
+        let call = builder.ins().call(local_func, &[count_val, elements_ptr]);
+        let results = builder.inst_results(call);
+        Ok((results[0], results[1]))
+    }
+
+    /// Generic bridge call for list operations: cons, first, rest, count, nth, empty?, concat
+    fn emit_bridge_call(
+        name: &str,
+        args: &[Value],
+        builder: &mut FunctionBuilder,
+        module: &mut ObjectModule,
+        strings: &HashMap<String, DataId>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
+        scope: &mut FnScope,
+        bridges: &HashMap<String, FuncId>,
+    ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
+        let bridge_id = bridges.get(name)
+            .ok_or_else(|| format!("bridge function {} not found", name))?;
+
+        let mut call_args = Vec::new();
+        for arg in args {
+            let (tag, payload) = Self::emit_expr(arg, builder, module, strings, functions, scope, bridges)?;
+            call_args.push(tag);
+            call_args.push(payload);
+        }
+
+        let local_func = module.declare_func_in_func(*bridge_id, builder.func);
+        let call = builder.ins().call(local_func, &call_args);
+        let results = builder.inst_results(call);
+        Ok((results[0], results[1]))
+    }
+
     /// (do expr1 expr2 ...)
     fn emit_do(
         args: &[Value],
         builder: &mut FunctionBuilder,
         module: &mut ObjectModule,
         strings: &HashMap<String, DataId>,
-        functions: &HashMap<String, (FuncId, usize)>,
+        functions: &HashMap<String, Vec<(FuncId, usize)>>,
         scope: &mut FnScope,
         bridges: &HashMap<String, FuncId>,
     ) -> Result<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value), String> {
@@ -659,34 +993,116 @@ impl Compiler {
         Ok((last_tag, last_payload))
     }
 
+    /// Macro expansion pre-pass: evaluate defmacro forms and expand macros in the AST.
+    /// Uses the interpreter's Env to register macros (including prelude's when/unless).
+    fn expand_macros(exprs: &[Value]) -> Result<Vec<Value>, String> {
+        let mut env = Env::new();
+        builtins::register(&mut env);
+        prelude::load(&mut env).map_err(|e| format!("prelude load error: {}", e))?;
+
+        let mut result = Vec::new();
+        for expr in exprs {
+            // Evaluate defmacro forms to register macros, then skip them
+            if let Value::List(items) = expr {
+                if let Some(Value::Symbol(sym)) = items.first() {
+                    if sym.as_str() == "defmacro" {
+                        eval::eval(expr, &mut env)
+                            .map_err(|e| format!("macro definition error: {}", e))?;
+                        continue;
+                    }
+                }
+            }
+            // Recursively expand macros in the expression
+            let expanded = Self::expand_expr(expr, &mut env)?;
+            result.push(expanded);
+        }
+        Ok(result)
+    }
+
+    /// Recursively expand macros in a single expression.
+    fn expand_expr(expr: &Value, env: &mut Env) -> Result<Value, String> {
+        match expr {
+            Value::List(items) if !items.is_empty() => {
+                // Check if head is a macro
+                if let Value::Symbol(sym) = &items[0] {
+                    if let Ok(val) = env.get(sym) {
+                        if let Value::Macro(mac) = &val {
+                            // Expand macro without evaluating the result
+                            let expanded = eval::expand_macro(&mac, &items[1..], env)
+                                .map_err(|e| format!("macro expansion error: {}", e))?;
+                            // Recursively expand the result (macros may produce more macros)
+                            return Self::expand_expr(&expanded, env);
+                        }
+                    }
+                }
+                // Not a macro call — recursively expand children
+                let expanded_items: Result<Vec<Value>, String> = items.iter()
+                    .map(|item| Self::expand_expr(item, env))
+                    .collect();
+                Ok(Value::list(expanded_items?))
+            }
+            Value::Vec(items) => {
+                let expanded_items: Result<Vec<Value>, String> = items.iter()
+                    .map(|item| Self::expand_expr(item, env))
+                    .collect();
+                Ok(Value::vec(expanded_items?))
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
     /// Compile all expressions into an object file.
     pub fn compile_exprs(mut self, exprs: &[Value]) -> Result<Vec<u8>, String> {
         if exprs.is_empty() {
             return Err("nothing to compile".to_string());
         }
 
+        // Pass 0: macro expansion
+        let exprs = Self::expand_macros(exprs)?;
+
         // Pass 1: collect strings
-        self.collect_strings(exprs)?;
+        self.collect_strings(&exprs)?;
 
         // Pass 2: declare all top-level functions
-        self.declare_functions(exprs)?;
+        self.declare_functions(&exprs)?;
 
-        // Pass 3: compile each defun
+        // Pass 3: compile each defun (single + multi-arity)
         // Collect defun info first to avoid borrow issues
-        let defuns: Vec<(String, Vec<Value>, Vec<Value>)> = exprs.iter().filter_map(|expr| {
+        let defuns: Vec<(String, Vec<Value>, Vec<Value>)> = exprs.iter().flat_map(|expr| {
+            let mut result = Vec::new();
             if let Value::List(items) = expr {
-                if items.len() >= 4 {
+                if items.len() >= 3 {
                     if let (Value::Symbol(sym), Value::Symbol(name)) = (&items[0], &items[1]) {
                         if sym.as_str() == "defun" {
-                            if let Value::List(params) = &items[2] {
-                                let body = items[3..].to_vec();
-                                return Some((name.to_string(), params.to_vec(), body));
+                            // Check if multi-arity
+                            let is_multi = if let Value::List(first_clause) = &items[2] {
+                                !first_clause.is_empty() && matches!(&first_clause[0], Value::List(_) | Value::Vec(_))
+                            } else {
+                                false
+                            };
+
+                            if is_multi {
+                                for clause in &items[2..] {
+                                    if let Value::List(clause_items) = clause {
+                                        if clause_items.len() >= 2 {
+                                            if let Value::List(params) = &clause_items[0] {
+                                                let body = clause_items[1..].to_vec();
+                                                result.push((name.to_string(), params.to_vec(), body));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if items.len() >= 4 {
+                                if let Value::List(params) = &items[2] {
+                                    let body = items[3..].to_vec();
+                                    result.push((name.to_string(), params.to_vec(), body));
+                                }
                             }
                         }
                     }
                 }
             }
-            None
+            result
         }).collect();
 
         for (name, params, body) in &defuns {
@@ -911,5 +1327,124 @@ mod tests {
     fn test_compile_fibonacci() {
         let exprs = parse("(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 10)").unwrap();
         assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_macro_when() {
+        // when is defined in prelude — should be expanded to (if cond body nil)
+        let exprs = parse("(when true 42)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_macro_unless() {
+        let exprs = parse("(unless false 99)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_custom_macro() {
+        let exprs = parse("(defmacro double (x) `(+ ~x ~x)) (double 21)").unwrap();
+        assert!(Compiler::new().unwrap().compile_exprs(&exprs).is_ok());
+    }
+
+    #[test]
+    fn test_compile_loop_recur_sum() {
+        // Sum 1..10 using loop/recur
+        let exprs = parse("(loop [i 0 sum 0] (if (= i 10) sum (recur (+ i 1) (+ sum i))))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_loop_recur_in_defun() {
+        let exprs = parse("(defun sum-to (n) (loop [i 0 acc 0] (if (= i n) acc (recur (+ i 1) (+ acc i))))) (sum-to 100)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_loop_recur_simple() {
+        let exprs = parse("(loop [x 5] (if (= x 0) x (recur (- x 1))))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_macro_in_defun() {
+        // Macros inside function bodies should also be expanded
+        let exprs = parse("(defun f (x) (when (> x 0) x)) (f 5)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_multi_arity() {
+        let exprs = parse("(defun greet ((x) x) ((x y) (+ x y))) (greet 1) (greet 2 3)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_multi_arity_recursive() {
+        let exprs = parse("(defun f ((n) (f n 0)) ((n acc) (if (= n 0) acc (f (- n 1) (+ acc n))))) (f 10)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_literal() {
+        let exprs = parse("(list 1 2 3)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_empty() {
+        let exprs = parse("(list)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_first_rest() {
+        let exprs = parse("(def xs (list 1 2 3)) (first xs) (rest xs)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_cons() {
+        let exprs = parse("(cons 0 (list 1 2 3))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_count() {
+        let exprs = parse("(count (list 1 2 3))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_nth() {
+        let exprs = parse("(nth (list 10 20 30) 1)").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_empty_check() {
+        let exprs = parse("(empty? (list)) (empty? (list 1))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
+    }
+
+    #[test]
+    fn test_compile_list_in_defun() {
+        let exprs = parse("(defun sum-list (xs) (loop [remaining xs acc 0] (if (empty? remaining) acc (recur (rest remaining) (+ acc (first remaining)))))) (sum-list (list 1 2 3 4 5))").unwrap();
+        let result = Compiler::new().unwrap().compile_exprs(&exprs);
+        assert!(result.is_ok(), "compile error: {}", result.unwrap_err());
     }
 }

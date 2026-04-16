@@ -326,7 +326,7 @@ fn eval_defmacro(args: &[Value], env: &mut Env) -> LispResult {
 }
 
 /// マクロを展開する (引数は評価せずに渡す)
-fn expand_macro(mac: &LispFn, args: &[Value], _env: &mut Env) -> LispResult {
+pub fn expand_macro(mac: &LispFn, args: &[Value], _env: &mut Env) -> LispResult {
     if args.len() != mac.params.len() {
         return Err(LispError::new(format!(
             "macro {}: expected {} args, got {}",
